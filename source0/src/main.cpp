@@ -90,9 +90,9 @@ private:
     std::unique_ptr<FileNode> m_renderRoot = nullptr;
 
     // --- Interaktions- & Kamera-Zustand (Nur Render-Thread) ---
-    vf2d       m_cameraOffset = {0.0f, 0.0f};
+    vf2d            m_cameraOffset = {0.0f, 0.0f};
     float           m_cameraZoom   = 1.0f;
-    vi2d       m_lastMousePos = {0, 0};
+    vi2d            m_lastMousePos = {0, 0};
     const FileNode* m_hoveredNode  = nullptr;
 
     // Aktualisierungsintervall für das Layout während des Scans
@@ -126,7 +126,7 @@ public:
         draw.WorldOffset(m_cameraOffset);
 
         // 2. Treemap rekursiv zeichnen
-        m_hoveredNode              = nullptr;
+        m_hoveredNode         = nullptr;
         const vf2d mouseWorld = draw.ScreenToWorld(mouse.GetPosition());
 
         if (m_renderRoot)
@@ -392,7 +392,7 @@ private:
         draw.FilledRect(barPos, barSize, Pixel(15, 18, 22, 230), Colour::WHITE);
 
         const std::string scanStatus  = m_shared.isScanning ? "SCANNING..." : "SCAN FINISHED";
-        const Pixel  statusColor = m_shared.isScanning ? Colour::YELLOW : Colour::GREEN;
+        const Pixel       statusColor = m_shared.isScanning ? Colour::YELLOW : Colour::GREEN;
 
         draw.String({10.0f, 8.0f}, scanStatus, statusColor);
         draw.String({150.0f, 8.0f}, "Files: " + std::to_string(m_shared.totalFilesScanned.load()), Colour::WHITE);
