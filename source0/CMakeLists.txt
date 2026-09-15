@@ -32,19 +32,25 @@ if (ENABLE_LSAN)
     add_link_options(-fsanitize=leak)
 endif ()
 
+find_package(X11 REQUIRED COMPONENTS Xi) # 1. Request the Xi component
+find_package(OpenGL REQUIRED)
+find_package(PNG REQUIRED)
 
 file(GLOB_RECURSE SOURCE_FILES src/*.cpp)
 
 add_executable(
-        ${PROJECT_NAME}
-        ${SOURCE_FILES}
+    ${PROJECT_NAME}
+    ${SOURCE_FILES}
 )
 
-
-target_link_libraries(
-        ${PROJECT_NAME}
-        PRIVATE
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    X11::X11
+    X11::Xi                              # 2. Link the XInput library
+    OpenGL::GL
+    PNG::PNG
+    pthread
 )
+
 
 target_include_directories(
         ${PROJECT_NAME}
@@ -54,4 +60,4 @@ target_include_directories(
 )
 
 
-#     mkdir build && cd build && cmake .. && cmake --build .
+#     mkdir build && cd build && cmake .. -GNinja -DCMAKE_BUILD_TYPE=Release && cmake --build .

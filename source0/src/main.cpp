@@ -10,7 +10,7 @@
 #include <chrono>
 
 // PGE3 Single-Header Include
-#define OLC_PGE_APPLICATION
+#define OLC_PGE3_APPLICATION
 #include "olcPixelGameEngine3.h"
 
 namespace fs = std::filesystem;
@@ -335,7 +335,8 @@ private:
 
         // Text bei ausreichender Größe einblenden
         if (node->visualSize.x * m_cameraZoom > 60.0f && node->visualSize.y * m_cameraZoom > 20.0f) {
-            draw.String(node->visualPos + olc::vf2d{ 4.0f, 4.0f }, node->name, olc::Colour::BLACK, 1.0f / m_cameraZoom);
+            float invZoom = 1.0f / m_cameraZoom;
+            draw.String(node->visualPos + olc::vf2d{ 4.0f, 4.0f }, node->name,  olc::Colour::BLACK, { invZoom, invZoom });
         }
     }
 
