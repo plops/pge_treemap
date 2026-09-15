@@ -20,7 +20,7 @@ namespace {
         std::string name;
         uintmax_t sizeBytes = 0;
         bool isDirectory = false;
-        std::vector<std::unique_ptr<FileNode>> children;
+        std::vector<std::unique_ptr<FileNode> > children;
 
         vf2d visualPos = {0.0f, 0.0f};
         vf2d visualSize = {0.0f, 0.0f};
@@ -58,13 +58,14 @@ namespace {
         if (dotPos == std::string_view::npos) return {120, 130, 140};
 
         std::string ext(name.substr(dotPos));
-        for (char &c : ext) c = static_cast<char>(tolower(c));
+        for (char &c: ext) c = static_cast<char>(tolower(c));
 
         if (ext == ".mp4" || ext == ".mkv" || ext == ".avi" || ext == ".mov") return {185, 60, 220};
         if (ext == ".mp3" || ext == ".flac" || ext == ".wav" || ext == ".ogg") return {240, 205, 35};
         if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp" || ext == ".gif") return {30, 190, 230};
         if (ext == ".zip" || ext == ".rar" || ext == ".7z" || ext == ".tar" || ext == ".gz") return {235, 50, 50};
-        if (ext == ".cpp" || ext == ".h" || ext == ".rs" || ext == ".py" || ext == ".js" || ext == ".txt" || ext == ".md") return {40, 210, 110};
+        if (ext == ".cpp" || ext == ".h" || ext == ".rs" || ext == ".py" || ext == ".js" || ext == ".txt" || ext ==
+            ".md") return {40, 210, 110};
         if (ext == ".exe" || ext == ".dll" || ext == ".so" || ext == ".bin") return {60, 100, 240};
 
         const size_t hash = std::hash<std::string>{}(ext);
@@ -75,6 +76,7 @@ namespace {
 class DiskTreemapAnalyzer : public PixelGameEngine {
 public:
     DiskTreemapAnalyzer() { sAppName = "PGE3 - Live Disk Treemap Visualizer"; }
+
     ~DiskTreemapAnalyzer() override {
         m_shared.abortScanRequested = true;
         if (m_scanThread.joinable()) m_scanThread.join();
@@ -118,7 +120,8 @@ public:
             std::swap(m_renderRoot, newTree);
             if (newTree) {
                 // Destroy previous tree on a background thread to prevent UI stutter
-                std::thread([old = std::move(newTree)]() {}).detach();
+                std::thread([old = std::move(newTree)]() {
+                }).detach();
             }
         }
 
@@ -166,7 +169,8 @@ private:
 
     void ScanDirectoryRecursive(const fs::path &currentPath, FileNode *parentNode) {
         try {
-            for (const auto &entry : fs::directory_iterator(currentPath, fs::directory_options::skip_permission_denied)) {
+            for (const auto &entry:
+                 fs::directory_iterator(currentPath, fs::directory_options::skip_permission_denied)) {
                 if (m_shared.abortScanRequested) return;
 
                 auto child = std::make_unique<FileNode>();
@@ -198,7 +202,8 @@ private:
                     }
                 }
             }
-        } catch (...) {}
+        } catch (...) {
+        }
     }
 
     void PublishSnapshot(const std::string &currentInspectedPath) {
@@ -234,7 +239,7 @@ private:
         const bool splitVertical = size.x >= size.y;
         float currentOffset = 0.0f;
 
-        for (auto &child : node->children) {
+        for (auto &child: node->children) {
             if (child->sizeBytes == 0) continue;
 
             const float ratio = static_cast<float>(child->sizeBytes) / static_cast<float>(node->sizeBytes);
@@ -275,7 +280,7 @@ private:
         } else {
             copy->sizeBytes = 0;
             copy->children.reserve(source->children.size());
-            for (const auto &child : source->children) {
+            for (const auto &child: source->children) {
                 // Ignore 0-byte items completely
                 if (child->sizeBytes == 0 && !child->isDirectory) continue;
 
@@ -340,7 +345,7 @@ private:
         if (node->children.empty()) {
             DrawCushionRect(node->visualPos, node->visualSize, node->color);
         } else {
-            for (const auto &child : node->children) {
+            for (const auto &child: node->children) {
                 RenderNode(child.get(), mouseWorld);
             }
             draw.Rect(node->visualPos, node->visualSize, Pixel(0, 0, 0, 160));
