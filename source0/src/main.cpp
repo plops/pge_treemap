@@ -29,7 +29,7 @@ struct FileNode {
     // Koordinaten im virtuellen Welt-Raum (wird vom Treemap-Algorithmus berechnet)
     olc::vf2d visualPos  = { 0.0f, 0.0f };
     olc::vf2d visualSize = { 0.0f, 0.0f };
-    olc::Pixel color     = olc::WHITE;
+    olc::Pixel color     = olc::Colour::WHITE;
 };
 
 // ============================================================================
@@ -38,7 +38,6 @@ struct FileNode {
 
 struct SharedScanContext {
     // Dieser Mutex schützt AUSSCHLIESSLICH den Zugriff auf den Datenbaum
-    // und Strings, die während des Scans dynamisch wachsen.
     mutable std::mutex treeMutex;
     std::unique_ptr<FileNode> rootNode = nullptr;
     std::string currentPathInspected   = "";
@@ -72,10 +71,14 @@ public:
     }
 
 private:
+    // --- Bildschirm- & Canvas-Konfiguration ---
+    const olc::vi2d m_screenSize = { 1280, 720 };
+    const olc::vf2d WORLD_CANVAS_SIZE = { 1000.0f, 1000.0f };
+
     // --- Threading & Daten ---
     SharedScanContext m_shared;
     std::thread m_scanThread;
-    std::unique_ptr<FileNode> m_renderRoot = nullptr; // Lokaler Schnappschuss für den Render-Thread
+    std::unique_ptr<FileNode> m_renderRoot = nullptr;
 
     // --- Interaktions- & Kamera-Zustand (Nur Render-Thread) ---
     olc::vf2d m_cameraOffset = { 0.0f, 0.0f };
@@ -83,17 +86,16 @@ private:
     olc::vi2d m_lastMousePos = { 0, 0 };
     const FileNode* m_hoveredNode = nullptr;
 
-    // Aktualisierungsintervall für das Layout während des Scans (z. B. alle 500 ms)
+    // Aktualisierungsintervall für das Layout während des Scans
     std::chrono::steady_clock::time_point m_lastLayoutUpdate;
     const std::chrono::milliseconds LAYOUT_REFRESH_RATE{ 400 };
-
-    const olc::vf2d WORLD_CANVAS_SIZE = { 1000.0f, 1000.0f };
 
 public:
     bool OnUserCreate() override {
         m_lastLayoutUpdate = std::chrono::steady_clock::now();
+        m_lastMousePos = mouse.GetPosition();
 
-        // Starte Scan im Standard-Ordner (z.B. Home oder aktuelles Verzeichnis)
+        // Scan im aktuellen Arbeitsverzeichnis starten
         StartBackgroundScan(fs::current_path());
         return true;
     }
@@ -103,7 +105,7 @@ public:
         CheckAndRebuildLayout();
 
         // --------------------------------------------------------------------
-        // RENDERING PIPELINE (PGE3 Native Hardware Acceleration)
+        // RENDERING PIPELINE (PGE3 Hardware Draw Interface)
         // --------------------------------------------------------------------
         draw.Clear(olc::Pixel(20, 24, 30));
 
@@ -114,13 +116,13 @@ public:
 
         // 2. Treemap rekursiv zeichnen
         m_hoveredNode = nullptr;
-        olc::vf2d mouseWorld = draw.ScreenToWorld(mouse.GetPos());
+        olc::vf2d mouseWorld = draw.ScreenToWorld(mouse.GetPosition());
 
         if (m_renderRoot) {
             RenderNode(m_renderRoot.get(), mouseWorld);
         }
 
-        // 3. UI-HUD im Screen-Space zeichnen (Affine Transformationen zurücksetzen)
+        // 3. UI-HUD im Screen-Space zeichnen (Transformationen zurücksetzen)
         draw.WorldReset();
         RenderHUD();
 
@@ -143,7 +145,6 @@ private:
             root->name = targetDirectory.filename().string();
             root->isDirectory = true;
 
-            // Root sofort im Shared-State registrieren, damit das Layout initial beginnen kann
             {
                 std::lock_guard<std::mutex> lock(m_shared.treeMutex);
                 m_shared.rootNode = std::make_unique<FileNode>();
@@ -154,7 +155,6 @@ private:
 
             ScanDirectoryRecursive(targetDirectory, root.get());
 
-            // Scan beendet: Finale Übergabe des kompletten Baums
             if (!m_shared.abortScanRequested) {
                 std::lock_guard<std::mutex> lock(m_shared.treeMutex);
                 m_shared.rootNode = std::move(root);
@@ -187,13 +187,11 @@ private:
 
                 parentNode->sizeBytes += child->sizeBytes;
 
-                // Status-Atomics updaten
                 m_shared.totalFilesScanned++;
                 m_shared.totalBytesScanned += child->sizeBytes;
 
                 parentNode->children.push_back(std::move(child));
 
-                // Zwischendurch den Render-Thread benachrichtigen (nicht bei jeder einzelnen Datei)
                 if (m_shared.totalFilesScanned % 250 == 0) {
                     std::lock_guard<std::mutex> lock(m_shared.treeMutex);
                     m_shared.currentPathInspected = entry.path().string();
@@ -201,12 +199,12 @@ private:
                 }
             }
         } catch (...) {
-            // Ignoriere unzureichende Berechtigungen auf Linux (/proc, /root etc.)
+            // Ignoriere unzureichende Berechtigungen auf Linux
         }
     }
 
     // ========================================================================
-    // LAYOUT-GENERIERUNG (Alternating-Axis Bisection)
+    // LAYOUT-GENERIERUNG
     // ========================================================================
     void CheckAndRebuildLayout() {
         auto now = std::chrono::steady_clock::now();
@@ -216,7 +214,6 @@ private:
             m_shared.hasNewDataForLayout = false;
             m_lastLayoutUpdate = now;
 
-            // Schnappschuss synchronisieren (Minimaler Lock)
             std::unique_ptr<FileNode> treeSnapshot = nullptr;
             {
                 std::lock_guard<std::mutex> lock(m_shared.treeMutex);
@@ -226,11 +223,9 @@ private:
             }
 
             if (treeSnapshot) {
-                // Layout im virtuellen Raum [0, 0] bis [WORLD_CANVAS_SIZE] berechnen
                 treeSnapshot->visualPos  = { 0.0f, 0.0f };
                 treeSnapshot->visualSize = WORLD_CANVAS_SIZE;
                 CalculateTreemapLayout(treeSnapshot.get(), treeSnapshot->visualPos, treeSnapshot->visualSize, 0);
-
                 m_renderRoot = std::move(treeSnapshot);
             }
         }
@@ -239,13 +234,11 @@ private:
     void CalculateTreemapLayout(FileNode* node, olc::vf2d pos, olc::vf2d size, int depth) {
         if (!node || node->children.empty() || node->sizeBytes == 0) return;
 
-        // Farben basierend auf Tiefe und Typ zuweisen
         uint8_t r = (depth * 45 + 70) % 255;
         uint8_t g = (depth * 85 + 100) % 255;
         uint8_t b = (depth * 125 + 130) % 255;
         node->color = olc::Pixel(r, g, b);
 
-        // Schneide entlang der längeren Kante (Slice and Dice)
         bool splitVertical = size.x >= size.y;
         float currentOffset = 0.0f;
 
@@ -266,7 +259,6 @@ private:
                 currentOffset += childHeight;
             }
 
-            // Rekursion für Unterordner
             CalculateTreemapLayout(child.get(), child->visualPos, child->visualSize, depth + 1);
         }
     }
@@ -285,30 +277,29 @@ private:
     }
 
     // ========================================================================
-    // EINGABE & INTERAKTION (PGE3 Affine Controls)
+    // EINGABE & INTERAKTION (PGE3 hw::Mouse & hw::Keyboard)
     // ========================================================================
     void HandleInput(float fElapsedTime) {
-        // Panning: Mittlere Maustaste oder Linksklick-Drag
-        if (mouse.GetButton(olc::mouse::Button::Left).bHeld || mouse.GetButton(olc::mouse::Button::Middle).bHeld) {
-            olc::vi2d delta = mouse.GetPos() - m_lastMousePos;
+        // PGE3 Mouse Buttons: 0 = Links, 1 = Rechts, 2 = Mitte
+        if (mouse.GetButton(0).bHeld || mouse.GetButton(2).bHeld) {
+            olc::vi2d delta = mouse.GetPosition() - m_lastMousePos;
             m_cameraOffset += olc::vf2d(delta) / m_cameraZoom;
         }
-        m_lastMousePos = mouse.GetPos();
+        m_lastMousePos = mouse.GetPosition();
 
-        // Zoom: Mausrad zoomt auf die Cursor-Position in der Welt
+        // Zoom über Mausrad mit Erhalt des Fokuspunktes
         int wheel = mouse.GetWheel();
         if (wheel != 0) {
-            olc::vf2d mouseBeforeZoom = draw.ScreenToWorld(mouse.GetPos());
+            olc::vf2d mouseBeforeZoom = draw.ScreenToWorld(mouse.GetPosition());
             if (wheel > 0) m_cameraZoom *= 1.15f;
             if (wheel < 0) m_cameraZoom /= 1.15f;
             m_cameraZoom = std::clamp(m_cameraZoom, 0.05f, 100.0f);
 
-            // Fokuspunkt unter der Maus beibehalten
-            olc::vf2d mouseAfterZoom = draw.ScreenToWorld(mouse.GetPos());
+            olc::vf2d mouseAfterZoom = draw.ScreenToWorld(mouse.GetPosition());
             m_cameraOffset += (mouseAfterZoom - mouseBeforeZoom);
         }
 
-        // Reset Taste
+        // Reset-Kamera mit Leertaste
         if (keyboard.GetKey(olc::Key::SPACE).bPressed) {
             m_cameraOffset = { 0.0f, 0.0f };
             m_cameraZoom   = 1.0f;
@@ -316,60 +307,56 @@ private:
     }
 
     // ========================================================================
-    // RENDERING DER RECHTECKE & TEXTE (PGE3 Hardware Draw Interface)
+    // RENDERING (PGE3 Hardware Draw Interface)
     // ========================================================================
     void RenderNode(const FileNode* node, const olc::vf2d& mouseWorld) {
         if (!node) return;
 
-        // Culling: Überspringe Knoten, die zu klein sind, um dargestellt zu werden
+        // Culling für zu kleine Elemente
         if (node->visualSize.x * m_cameraZoom < 1.5f || node->visualSize.y * m_cameraZoom < 1.5f) {
             return;
         }
 
-        // Treemap-Blätter (Dateien) oder Ordner ohne Kinder füllen
         if (node->children.empty()) {
-            draw.FilledRect(node->visualPos, node->visualSize, node->color);
+            draw.FilledRect(node->visualPos, node->visualSize, node->color, olc::Colour::WHITE);
             draw.Rect(node->visualPos, node->visualSize, olc::Pixel(10, 10, 10, 180));
         } else {
-            // Für Ordner: Zeichne Kinder rekursiv
             for (const auto& child : node->children) {
                 RenderNode(child.get(), mouseWorld);
             }
-            // Umrandung um den Ordner
-            draw.Rect(node->visualPos, node->visualSize, olc::WHITE);
+            draw.Rect(node->visualPos, node->visualSize, olc::Colour::WHITE);
         }
 
-        // Hover-Detection im World-Space
+        // Hover-Abfrage im World-Space
         if (mouseWorld.x >= node->visualPos.x && mouseWorld.x <= (node->visualPos.x + node->visualSize.x) &&
             mouseWorld.y >= node->visualPos.y && mouseWorld.y <= (node->visualPos.y + node->visualSize.y)) {
             m_hoveredNode = node;
         }
 
-        // Text nur zeichnen, wenn das Rechteck auf dem Bildschirm groß genug ist
+        // Text bei ausreichender Größe einblenden
         if (node->visualSize.x * m_cameraZoom > 60.0f && node->visualSize.y * m_cameraZoom > 20.0f) {
-            // PGE3 Text Rendering
-            draw.String(node->visualPos + olc::vf2d{ 4.0f, 4.0f }, node->name, olc::BLACK, 1.0f / m_cameraZoom);
+            draw.String(node->visualPos + olc::vf2d{ 4.0f, 4.0f }, node->name, olc::Colour::BLACK, 1.0f / m_cameraZoom);
         }
     }
 
     void RenderHUD() {
-        // Statusleiste Hintergrund
-        draw.FilledRect({ 0, 0 }, { (float)GetDrawTargetWidth(), 45.0f }, olc::Pixel(15, 18, 22, 230));
+        // Statusleiste
+        olc::vf2d barPos = { 0.0f, 0.0f };
+        olc::vf2d barSize = { static_cast<float>(m_screenSize.x), 45.0f };
+        draw.FilledRect(barPos, barSize, olc::Pixel(15, 18, 22, 230), olc::Colour::WHITE);
 
-        // Scan-Fortschritt
         std::string scanStatus = m_shared.isScanning ? "SCANNING..." : "SCAN FINISHED";
-        olc::Pixel statusColor = m_shared.isScanning ? olc::YELLOW : olc::GREEN;
+        olc::Pixel statusColor = m_shared.isScanning ? olc::Colour::YELLOW : olc::Colour::GREEN;
 
-        draw.String({ 10, 8 }, scanStatus, statusColor);
-        draw.String({ 150, 8 }, "Files: " + std::to_string(m_shared.totalFilesScanned.load()), olc::WHITE);
-        draw.String({ 320, 8 }, "Size: " + FormatBytes(m_shared.totalBytesScanned.load()), olc::CYAN);
+        draw.String({ 10.0f, 8.0f }, scanStatus, statusColor);
+        draw.String({ 150.0f, 8.0f }, "Files: " + std::to_string(m_shared.totalFilesScanned.load()), olc::Colour::WHITE);
+        draw.String({ 320.0f, 8.0f }, "Size: " + FormatBytes(m_shared.totalBytesScanned.load()), olc::Colour::CYAN);
 
-        // Tooltip bei Mouse-Hover
         if (m_hoveredNode) {
             std::string hoverInfo = m_hoveredNode->name + " (" + FormatBytes(m_hoveredNode->sizeBytes) + ")";
-            draw.String({ 10, 26 }, hoverInfo, olc::WHITE);
+            draw.String({ 10.0f, 26.0f }, hoverInfo, olc::Colour::WHITE);
         } else {
-            draw.String({ 10, 26 }, "Pan: Left/Middle Drag | Zoom: Mouse Wheel | Reset: Space", olc::DARK_GREY);
+            draw.String({ 10.0f, 26.0f }, "Pan: Left/Middle Drag | Zoom: Wheel | Reset: Space", olc::Colour::DARK_GREY);
         }
     }
 
@@ -388,14 +375,13 @@ private:
 };
 
 // ============================================================================
-// MAIN FUNCTION & PGE3 CONFIGURATION
+// MAIN FUNCTION & PGE3 CONSTRUCT
 // ============================================================================
 int main() {
     DiskTreemapAnalyzer demo;
 
-    // In PGE3: Saubere Konfigurationsstruktur statt überladener Flags
-    // (Fenster 1280x720, Pixelgröße 1x1, VSync aktiviert)
-    if (demo.Construct(1280, 720, 1, 1, false, true)) {
+    // PGE3 Konstruktor mit Screen- und Pixel-Größe
+    if (demo.Construct({ 1280, 720 }, { 1, 1 }, false)) {
         demo.Start();
     }
     return 0;
