@@ -1,8 +1,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -20,7 +22,7 @@ namespace {
         std::string name;
         uintmax_t sizeBytes = 0;
         bool isDirectory = false;
-        std::vector<std::unique_ptr<FileNode> > children;
+        std::vector<std::unique_ptr<FileNode>> children;
 
         vf2d visualPos = {0.0f, 0.0f};
         vf2d visualSize = {0.0f, 0.0f};
@@ -37,6 +39,18 @@ namespace {
         std::atomic<uintmax_t> totalFilesScanned{0};
         std::atomic<uintmax_t> totalBytesScanned{0};
         std::atomic<bool> hasNewDataForRender{false};
+    };
+
+    struct SquarifyItem {
+        FileNode *node = nullptr;
+        double area = 0.0;
+    };
+
+    struct LayoutRect {
+        float x = 0.0f;
+        float y = 0.0f;
+        float w = 0.0f;
+        float h = 0.0f;
     };
 
     Pixel HSLtoPixel(float h, float s, float l) {
@@ -64,8 +78,7 @@ namespace {
         if (ext == ".mp3" || ext == ".flac" || ext == ".wav" || ext == ".ogg") return {240, 205, 35};
         if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp" || ext == ".gif") return {30, 190, 230};
         if (ext == ".zip" || ext == ".rar" || ext == ".7z" || ext == ".tar" || ext == ".gz") return {235, 50, 50};
-        if (ext == ".cpp" || ext == ".h" || ext == ".rs" || ext == ".py" || ext == ".js" || ext == ".txt" || ext ==
-            ".md")
+        if (ext == ".cpp" || ext == ".h" || ext == ".rs" || ext == ".py" || ext == ".js" || ext == ".txt" || ext == ".md")
             return {40, 210, 110};
         if (ext == ".exe" || ext == ".dll" || ext == ".so" || ext == ".bin") return {60, 100, 240};
 
@@ -226,43 +239,172 @@ namespace {
             }
         }
 
+        static double WorstAspectRatio(const std::vector<SquarifyItem> &row, double rowAreaSum, double s) {
+            if (row.empty() || s <= 0.0 || rowAreaSum <= 0.0) {
+                return std::numeric_limits<double>::infinity();
+            }
+            const double s2 = s * s;
+            const double sum2 = rowAreaSum * rowAreaSum;
+            double maxRatio = 0.0;
+            for (const auto &item : row) {
+                if (item.area <= 0.0) continue;
+                const double r1 = (item.area * s2) / sum2;
+                const double r2 = sum2 / (item.area * s2);
+                const double r = (r1 > r2) ? r1 : r2;
+                if (r > maxRatio) {
+                    maxRatio = r;
+                }
+            }
+            return maxRatio;
+        }
+
+        static void LayoutRow(const std::vector<SquarifyItem> &row, double rowAreaSum,
+                              LayoutRect &rect, bool isLastRow) {
+            if (row.empty()) return;
+
+            if (rect.w <= 0.0f || rect.h <= 0.0f || rowAreaSum <= 0.0) {
+                for (const auto &item : row) {
+                    item.node->visualPos = {rect.x, rect.y};
+                    item.node->visualSize = {0.0f, 0.0f};
+                }
+                return;
+            }
+
+            if (rect.w >= rect.h) {
+                // Vertical strip placed along height rect.h
+                float rowThickness = isLastRow ? rect.w : static_cast<float>(rowAreaSum / rect.h);
+                rowThickness = std::clamp(rowThickness, 0.0f, rect.w);
+
+                float currentY = rect.y;
+                for (size_t i = 0; i < row.size(); ++i) {
+                    FileNode *child = row[i].node;
+                    float itemHeight = 0.0f;
+                    if (i == row.size() - 1) {
+                        itemHeight = (rect.y + rect.h) - currentY;
+                    } else {
+                        itemHeight = static_cast<float>((row[i].area / rowAreaSum) * rect.h);
+                    }
+                    itemHeight = std::max(0.0f, itemHeight);
+
+                    child->visualPos = {rect.x, currentY};
+                    child->visualSize = {rowThickness, itemHeight};
+                    currentY += itemHeight;
+
+                    if (child->visualSize.x >= 0.5f && child->visualSize.y >= 0.5f && !child->children.empty()) {
+                        CalculateTreemapLayout(child, child->visualPos, child->visualSize);
+                    }
+                }
+
+                rect.x += rowThickness;
+                rect.w -= rowThickness;
+                if (rect.w < 0.0f) rect.w = 0.0f;
+            } else {
+                // Horizontal strip placed along width rect.w
+                float rowThickness = isLastRow ? rect.h : static_cast<float>(rowAreaSum / rect.w);
+                rowThickness = std::clamp(rowThickness, 0.0f, rect.h);
+
+                float currentX = rect.x;
+                for (size_t i = 0; i < row.size(); ++i) {
+                    FileNode *child = row[i].node;
+                    float itemWidth = 0.0f;
+                    if (i == row.size() - 1) {
+                        itemWidth = (rect.x + rect.w) - currentX;
+                    } else {
+                        itemWidth = static_cast<float>((row[i].area / rowAreaSum) * rect.w);
+                    }
+                    itemWidth = std::max(0.0f, itemWidth);
+
+                    child->visualPos = {currentX, rect.y};
+                    child->visualSize = {itemWidth, rowThickness};
+                    currentX += itemWidth;
+
+                    if (child->visualSize.x >= 0.5f && child->visualSize.y >= 0.5f && !child->children.empty()) {
+                        CalculateTreemapLayout(child, child->visualPos, child->visualSize);
+                    }
+                }
+
+                rect.y += rowThickness;
+                rect.h -= rowThickness;
+                if (rect.h < 0.0f) rect.h = 0.0f;
+            }
+        }
+
         static void CalculateTreemapLayout(FileNode *node, vf2d pos, vf2d size) {
             if (!node || node->sizeBytes == 0) return;
+            node->visualPos = pos;
+            node->visualSize = size;
 
-            // OPTIMIZATION: Sub-pixel pruning. If container is < 1px, stop subdividing.
-            if (size.x < 1.0f || size.y < 1.0f || node->children.empty()) return;
+            // Stop subdividing if container is sub-pixel (< 0.5px) or leaf
+            if (size.x < 0.5f || size.y < 0.5f || node->children.empty()) return;
 
             std::ranges::sort(node->children,
                               [](const auto &a, const auto &b) { return a->sizeBytes > b->sizeBytes; });
 
-            const bool splitVertical = size.x >= size.y;
-            float currentOffset = 0.0f;
+            uintmax_t totalBytes = 0;
+            for (const auto &child : node->children) {
+                if (child && child->sizeBytes > 0) {
+                    totalBytes += child->sizeBytes;
+                }
+            }
+            if (totalBytes == 0) return;
 
-            for (auto &child: node->children) {
-                if (child->sizeBytes == 0) continue;
+            const double totalArea = static_cast<double>(size.x) * static_cast<double>(size.y);
+            std::vector<SquarifyItem> items;
+            items.reserve(node->children.size());
 
-                const float ratio = static_cast<float>(child->sizeBytes) / static_cast<float>(node->sizeBytes);
+            for (const auto &child : node->children) {
+                if (child && child->sizeBytes > 0) {
+                    const double area = (static_cast<double>(child->sizeBytes) / static_cast<double>(totalBytes)) * totalArea;
+                    items.push_back({child.get(), area});
+                } else if (child) {
+                    child->visualPos = pos;
+                    child->visualSize = {0.0f, 0.0f};
+                }
+            }
 
-                if (splitVertical) {
-                    float childWidth = size.x * ratio;
-                    child->visualPos = {pos.x + currentOffset, pos.y};
-                    child->visualSize = {childWidth, size.y};
-                    currentOffset += childWidth;
+            if (items.empty()) return;
 
-                    // Prune microscopic slices (< 0.5px) from recursing further
-                    if (childWidth >= 0.5f) {
-                        CalculateTreemapLayout(child.get(), child->visualPos, child->visualSize);
-                    }
+            LayoutRect rect = {pos.x, pos.y, size.x, size.y};
+            std::vector<SquarifyItem> currentRow;
+            double currentRowAreaSum = 0.0;
+
+            for (size_t i = 0; i < items.size(); ++i) {
+                const auto &candidate = items[i];
+
+                if (currentRow.empty()) {
+                    currentRow.push_back(candidate);
+                    currentRowAreaSum = candidate.area;
                 } else {
-                    float childHeight = size.y * ratio;
-                    child->visualPos = {pos.x, pos.y + currentOffset};
-                    child->visualSize = {size.x, childHeight};
-                    currentOffset += childHeight;
+                    const double s = (rect.w >= rect.h) ? rect.h : rect.w;
+                    const double currentWorst = WorstAspectRatio(currentRow, currentRowAreaSum, s);
 
-                    if (childHeight >= 0.5f) {
-                        CalculateTreemapLayout(child.get(), child->visualPos, child->visualSize);
+                    currentRow.push_back(candidate);
+                    const double newWorst = WorstAspectRatio(currentRow, currentRowAreaSum + candidate.area, s);
+
+                    if (newWorst <= currentWorst) {
+                        currentRowAreaSum += candidate.area;
+                    } else {
+                        // Adding candidate worsened aspect ratio; flush current row
+                        currentRow.pop_back();
+                        LayoutRow(currentRow, currentRowAreaSum, rect, false);
+                        currentRow.clear();
+
+                        if (rect.w <= 0.0f || rect.h <= 0.0f) {
+                            for (size_t j = i; j < items.size(); ++j) {
+                                items[j].node->visualPos = {rect.x, rect.y};
+                                items[j].node->visualSize = {0.0f, 0.0f};
+                            }
+                            break;
+                        }
+
+                        currentRow.push_back(candidate);
+                        currentRowAreaSum = candidate.area;
                     }
                 }
+            }
+
+            if (!currentRow.empty()) {
+                LayoutRow(currentRow, currentRowAreaSum, rect, true);
             }
         }
 
