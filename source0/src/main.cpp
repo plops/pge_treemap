@@ -28,9 +28,9 @@ struct FileNode {
     std::vector<std::unique_ptr<FileNode>> children;
 
     // Koordinaten im virtuellen Welt-Raum (wird vom Treemap-Algorithmus berechnet)
-    olc::vf2d  visualPos  = {0.0f, 0.0f};
-    olc::vf2d  visualSize = {0.0f, 0.0f};
-    olc::Pixel color      = olc::Colour::WHITE;
+    vf2d  visualPos  = {0.0f, 0.0f};
+    vf2d  visualSize = {0.0f, 0.0f};
+    Pixel color      = Colour::WHITE;
 };
 } // namespace
 
@@ -61,7 +61,7 @@ struct SharedScanContext {
 // ============================================================================
 
 namespace {
-class DiskTreemapAnalyzer : public olc::PixelGameEngine
+class DiskTreemapAnalyzer : public PixelGameEngine
 {
 public:
     DiskTreemapAnalyzer()
@@ -81,8 +81,8 @@ public:
 
 private:
     // --- Bildschirm- & Canvas-Konfiguration ---
-    const olc::vi2d m_screenSize      = {1280, 720};
-    const olc::vf2d WORLD_CANVAS_SIZE = {1000.0f, 1000.0f};
+    const vi2d m_screenSize      = {1280, 720};
+    const vf2d WORLD_CANVAS_SIZE = {1000.0f, 1000.0f};
 
     // --- Threading & Daten ---
     SharedScanContext         m_shared;
@@ -90,9 +90,9 @@ private:
     std::unique_ptr<FileNode> m_renderRoot = nullptr;
 
     // --- Interaktions- & Kamera-Zustand (Nur Render-Thread) ---
-    olc::vf2d       m_cameraOffset = {0.0f, 0.0f};
+    vf2d       m_cameraOffset = {0.0f, 0.0f};
     float           m_cameraZoom   = 1.0f;
-    olc::vi2d       m_lastMousePos = {0, 0};
+    vi2d       m_lastMousePos = {0, 0};
     const FileNode* m_hoveredNode  = nullptr;
 
     // Aktualisierungsintervall für das Layout während des Scans
@@ -118,7 +118,7 @@ public:
         // --------------------------------------------------------------------
         // RENDERING PIPELINE (PGE3 Hardware Draw Interface)
         // --------------------------------------------------------------------
-        draw.Clear(olc::Pixel(20, 24, 30));
+        draw.Clear(Pixel(20, 24, 30));
 
         // 1. Affine Welt-Transformation auf die PGE3-Draw-Pipeline anwenden
         draw.WorldReset();
@@ -127,7 +127,7 @@ public:
 
         // 2. Treemap rekursiv zeichnen
         m_hoveredNode              = nullptr;
-        const olc::vf2d mouseWorld = draw.ScreenToWorld(mouse.GetPosition());
+        const vf2d mouseWorld = draw.ScreenToWorld(mouse.GetPosition());
 
         if (m_renderRoot)
         {
@@ -159,7 +159,7 @@ private:
             root->isDirectory = true;
 
             {
-                std::lock_guard<std::mutex> lock(m_shared.treeMutex);
+                std::lock_guard lock(m_shared.treeMutex);
                 m_shared.rootNode              = std::make_unique<FileNode>();
                 m_shared.rootNode->path        = root->path;
                 m_shared.rootNode->name        = root->name;
@@ -170,7 +170,7 @@ private:
 
             if (!m_shared.abortScanRequested)
             {
-                std::lock_guard<std::mutex> lock(m_shared.treeMutex);
+                std::lock_guard lock(m_shared.treeMutex);
                 m_shared.rootNode            = std::move(root);
                 m_shared.hasNewDataForLayout = true;
             }
@@ -216,7 +216,7 @@ private:
 
                 if (m_shared.totalFilesScanned % 250 == 0)
                 {
-                    std::lock_guard<std::mutex> lock(m_shared.treeMutex);
+                    std::lock_guard lock(m_shared.treeMutex);
                     m_shared.currentPathInspected = entry.path().string();
                     m_shared.hasNewDataForLayout  = true;
                 }
@@ -241,7 +241,7 @@ private:
 
             std::unique_ptr<FileNode> treeSnapshot = nullptr;
             {
-                std::lock_guard<std::mutex> lock(m_shared.treeMutex);
+                std::lock_guard lock(m_shared.treeMutex);
                 if (m_shared.rootNode)
                 {
                     treeSnapshot = DeepCopyTree(m_shared.rootNode.get());
@@ -258,7 +258,7 @@ private:
         }
     }
 
-    static void CalculateTreemapLayout(FileNode* node, olc::vf2d pos, olc::vf2d size, const int depth)
+    static void CalculateTreemapLayout(FileNode* node, vf2d pos, vf2d size, const int depth)
     {
         if (!node || node->children.empty() || node->sizeBytes == 0) return;
 
@@ -318,25 +318,25 @@ private:
         // PGE3 Mouse Buttons: 0 = Links, 1 = Rechts, 2 = Mitte
         if (mouse.GetButton(0).bHeld || mouse.GetButton(2).bHeld)
         {
-            const olc::vi2d delta = mouse.GetPosition() - m_lastMousePos;
-            m_cameraOffset += olc::vf2d(delta) / m_cameraZoom;
+            const vi2d delta = mouse.GetPosition() - m_lastMousePos;
+            m_cameraOffset += vf2d(delta) / m_cameraZoom;
         }
         m_lastMousePos = mouse.GetPosition();
 
         // Zoom über Mausrad mit Erhalt des Fokuspunktes
-        if (int wheel = mouse.GetWheel(); wheel != 0)
+        if (const int wheel = mouse.GetWheel(); wheel != 0)
         {
-            const olc::vf2d mouseBeforeZoom = draw.ScreenToWorld(mouse.GetPosition());
+            const vf2d mouseBeforeZoom = draw.ScreenToWorld(mouse.GetPosition());
             if (wheel > 0) m_cameraZoom *= 1.15f;
             if (wheel < 0) m_cameraZoom /= 1.15f;
             m_cameraZoom = std::clamp(m_cameraZoom, 0.05f, 100.0f);
 
-            const olc::vf2d mouseAfterZoom = draw.ScreenToWorld(mouse.GetPosition());
-            m_cameraOffset += (mouseAfterZoom - mouseBeforeZoom);
+            const vf2d mouseAfterZoom = draw.ScreenToWorld(mouse.GetPosition());
+            m_cameraOffset += mouseAfterZoom - mouseBeforeZoom;
         }
 
         // Reset-Kamera mit Leertaste
-        if (keyboard.GetKey(olc::Key::SPACE).bPressed)
+        if (keyboard.GetKey(Key::SPACE).bPressed)
         {
             m_cameraOffset = {0.0f, 0.0f};
             m_cameraZoom   = 1.0f;
@@ -346,7 +346,7 @@ private:
     // ========================================================================
     // RENDERING (PGE3 Hardware Draw Interface)
     // ========================================================================
-    void RenderNode(const FileNode* node, const olc::vf2d& mouseWorld)
+    void RenderNode(const FileNode* node, const vf2d& mouseWorld)
     {
         if (!node) return;
 
@@ -358,8 +358,8 @@ private:
 
         if (node->children.empty())
         {
-            draw.FilledRect(node->visualPos, node->visualSize, node->color, olc::Colour::WHITE);
-            draw.Rect(node->visualPos, node->visualSize, olc::Pixel(10, 10, 10, 180));
+            draw.FilledRect(node->visualPos, node->visualSize, node->color, Colour::WHITE);
+            draw.Rect(node->visualPos, node->visualSize, Pixel(10, 10, 10, 180));
         }
         else
         {
@@ -367,7 +367,7 @@ private:
             {
                 RenderNode(child.get(), mouseWorld);
             }
-            draw.Rect(node->visualPos, node->visualSize, olc::Colour::WHITE);
+            draw.Rect(node->visualPos, node->visualSize, Colour::WHITE);
         }
 
         // Hover-Abfrage im World-Space
@@ -380,32 +380,32 @@ private:
         if (node->visualSize.x * m_cameraZoom > 60.0f && node->visualSize.y * m_cameraZoom > 20.0f)
         {
             float invZoom = 1.0f / m_cameraZoom;
-            draw.String(node->visualPos + olc::vf2d{4.0f, 4.0f}, node->name, olc::Colour::BLACK, {invZoom, invZoom});
+            draw.String(node->visualPos + vf2d{4.0f, 4.0f}, node->name, Colour::BLACK, {invZoom, invZoom});
         }
     }
 
     void RenderHUD()
     {
         // Statusleiste
-        constexpr olc::vf2d barPos  = {0.0f, 0.0f};
-        const olc::vf2d     barSize = {static_cast<float>(m_screenSize.x), 45.0f};
-        draw.FilledRect(barPos, barSize, olc::Pixel(15, 18, 22, 230), olc::Colour::WHITE);
+        constexpr vf2d barPos  = {0.0f, 0.0f};
+        const vf2d     barSize = {static_cast<float>(m_screenSize.x), 45.0f};
+        draw.FilledRect(barPos, barSize, Pixel(15, 18, 22, 230), Colour::WHITE);
 
         const std::string scanStatus  = m_shared.isScanning ? "SCANNING..." : "SCAN FINISHED";
-        const olc::Pixel  statusColor = m_shared.isScanning ? olc::Colour::YELLOW : olc::Colour::GREEN;
+        const Pixel  statusColor = m_shared.isScanning ? Colour::YELLOW : Colour::GREEN;
 
         draw.String({10.0f, 8.0f}, scanStatus, statusColor);
-        draw.String({150.0f, 8.0f}, "Files: " + std::to_string(m_shared.totalFilesScanned.load()), olc::Colour::WHITE);
-        draw.String({320.0f, 8.0f}, "Size: " + FormatBytes(m_shared.totalBytesScanned.load()), olc::Colour::CYAN);
+        draw.String({150.0f, 8.0f}, "Files: " + std::to_string(m_shared.totalFilesScanned.load()), Colour::WHITE);
+        draw.String({320.0f, 8.0f}, "Size: " + FormatBytes(m_shared.totalBytesScanned.load()), Colour::CYAN);
 
         if (m_hoveredNode)
         {
             const std::string hoverInfo = m_hoveredNode->name + " (" + FormatBytes(m_hoveredNode->sizeBytes) + ")";
-            draw.String({10.0f, 26.0f}, hoverInfo, olc::Colour::WHITE);
+            draw.String({10.0f, 26.0f}, hoverInfo, Colour::WHITE);
         }
         else
         {
-            draw.String({10.0f, 26.0f}, "Pan: Left/Middle Drag | Zoom: Wheel | Reset: Space", olc::Colour::DARK_GREY);
+            draw.String({10.0f, 26.0f}, "Pan: Left/Middle Drag | Zoom: Wheel | Reset: Space", Colour::DARK_GREY);
         }
     }
 
