@@ -1,4 +1,4 @@
-name: CMake Build GLFW gRPC Example 134
+name: CMake Build PGE Treemap
 
 on:
   push:
@@ -10,32 +10,35 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Install dependencies
-      run: sudo apt-get install -y cmake ninja-build libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev libpng-dev
 
     - name: Get PGE3 header
-      run: wget https://raw.githubusercontent.com/OneLoneCoder/olcPixelGameEngine3/refs/heads/main/olcPixelGameEngine3.h
-
-     - name: Create build directory
-       run: mkdir build
-
-#    - name: Setup tmate session
-#      uses: mxschmitt/action-tmate@v3
+      run: |
+        # Download PGE3 into source0/src for #include "olcPixelGameEngine3.h"
+        wget -P source0/src https://raw.githubusercontent.com/OneLoneCoder/olcPixelGameEngine3/refs/heads/main/olcPixelGameEngine3.h
+        
+        # Also create symlink to satisfy CMakeLists.txt hardcoded path
+        sudo mkdir -p /home/kiel/src/olcPixelGameEngine3
+        sudo ln -s "$GITHUB_WORKSPACE/source0/src/olcPixelGameEngine3.h" /home/kiel/src/olcPixelGameEngine3/olcPixelGameEngine3.h
 
     - name: Configure CMake
-      run: cmake -S source0 -B build -G Ninja  -DENABLE_ASAN:BOOL=OFF -DENABLE_LSAN:BOOL=OFF -DENABLE_UBSAN:BOOL=OFF -DCMAKE_BUILD_TYPE=Release
+      run: cmake -S source0 -B build -G Ninja -DENABLE_ASAN:BOOL=OFF -DENABLE_LSAN:BOOL=OFF -DENABLE_UBSAN:BOOL=OFF -DCMAKE_BUILD_TYPE=Release
 
     - name: Build with Ninja
       run: ninja -C build
 
     - name: Upload build artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: pge_treemap
         path: build/pge_treemap
+
