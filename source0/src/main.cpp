@@ -3,7 +3,6 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
-#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -239,33 +238,32 @@ namespace {
             }
         }
 
-        static double WorstAspectRatio(const std::vector<SquarifyItem> &row, double rowAreaSum, double s) {
+        static double WorstAspectRatio(const std::vector<SquarifyItem> &row, const double rowAreaSum, const double s) {
             if (row.empty() || s <= 0.0 || rowAreaSum <= 0.0) {
                 return std::numeric_limits<double>::infinity();
             }
             const double s2 = s * s;
             const double sum2 = rowAreaSum * rowAreaSum;
             double maxRatio = 0.0;
-            for (const auto &item : row) {
-                if (item.area <= 0.0) continue;
-                const double r1 = (item.area * s2) / sum2;
-                const double r2 = sum2 / (item.area * s2);
-                const double r = (r1 > r2) ? r1 : r2;
-                if (r > maxRatio) {
+            for (const auto &[node, area] : row) {
+                if (area <= 0.0) continue;
+                const double r1 = (area * s2) / sum2;
+                const double r2 = sum2 / (area * s2);
+                if (const double r = (r1 > r2) ? r1 : r2; r > maxRatio) {
                     maxRatio = r;
                 }
             }
             return maxRatio;
         }
 
-        static void LayoutRow(const std::vector<SquarifyItem> &row, double rowAreaSum,
-                              LayoutRect &rect, bool isLastRow) {
+        static void LayoutRow(const std::vector<SquarifyItem> &row, const double rowAreaSum,
+                              LayoutRect &rect, const bool isLastRow) {
             if (row.empty()) return;
 
             if (rect.w <= 0.0f || rect.h <= 0.0f || rowAreaSum <= 0.0) {
-                for (const auto &item : row) {
-                    item.node->visualPos = {rect.x, rect.y};
-                    item.node->visualSize = {0.0f, 0.0f};
+                for (const auto &[node, area] : row) {
+                    node->visualPos = {rect.x, rect.y};
+                    node->visualSize = {0.0f, 0.0f};
                 }
                 return;
             }
@@ -329,7 +327,7 @@ namespace {
             }
         }
 
-        static void CalculateTreemapLayout(FileNode *node, vf2d pos, vf2d size) {
+        static void CalculateTreemapLayout(FileNode *node, const vf2d pos, const vf2d size) {
             if (!node || node->sizeBytes == 0) return;
             node->visualPos = pos;
             node->visualSize = size;
@@ -355,7 +353,7 @@ namespace {
             for (const auto &child : node->children) {
                 if (child && child->sizeBytes > 0) {
                     const double area = (static_cast<double>(child->sizeBytes) / static_cast<double>(totalBytes)) * totalArea;
-                    items.push_back({child.get(), area});
+                    items.push_back({.node = child.get(), .area = area});
                 } else if (child) {
                     child->visualPos = pos;
                     child->visualSize = {0.0f, 0.0f};
@@ -364,7 +362,7 @@ namespace {
 
             if (items.empty()) return;
 
-            LayoutRect rect = {pos.x, pos.y, size.x, size.y};
+            LayoutRect rect = {.x=pos.x, .y=pos.y, .w=size.x, .h=size.y};
             std::vector<SquarifyItem> currentRow;
             double currentRowAreaSum = 0.0;
 
@@ -379,9 +377,8 @@ namespace {
                     const double currentWorst = WorstAspectRatio(currentRow, currentRowAreaSum, s);
 
                     currentRow.push_back(candidate);
-                    const double newWorst = WorstAspectRatio(currentRow, currentRowAreaSum + candidate.area, s);
 
-                    if (newWorst <= currentWorst) {
+                    if (const double newWorst = WorstAspectRatio(currentRow, currentRowAreaSum + candidate.area, s); newWorst <= currentWorst) {
                         currentRowAreaSum += candidate.area;
                     } else {
                         // Adding candidate worsened aspect ratio; flush current row
