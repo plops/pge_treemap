@@ -60,4 +60,4 @@ target_include_directories(
 )
 
 
-#     mkdir build && cd build && cmake .. -GNinja -DCMAKE_BUILD_TYPE=Release && cmake --build .
+#     mkdir build && cd build && cmake .. -GNinja -DCMAKE_BUILD_TYPE=Release -DENABLE_ASAN:BOOL=OFF -DENABLE_LSAN:BOOL=OFF -DENABLE_UBSAN:BOOL=OFF && cmake --build .
