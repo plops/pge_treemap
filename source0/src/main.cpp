@@ -252,7 +252,7 @@ namespace {
 
                     parentNode->children.push_back(std::move(child));
 
-                    if (m_shared.totalFilesScanned % 250 == 0) {
+                    if (m_shared.totalFilesScanned % 25000 == 0) {
                         std::lock_guard lock(m_shared.treeMutex);
                         m_shared.currentPathInspected = entry.path().string();
                         m_shared.hasNewDataForLayout = true;
@@ -428,7 +428,8 @@ namespace {
             // Hover-Abfrage im World-Space
             if (mouseWorld.x >= node->visualPos.x && mouseWorld.x <= (node->visualPos.x + node->visualSize.x) &&
                 mouseWorld.y >= node->visualPos.y && mouseWorld.y <= (node->visualPos.y + node->visualSize.y)) {
-                m_hoveredNode = node;
+                if (!m_hoveredNode)
+                    m_hoveredNode = node;
             }
 
             // Beschriftung nur anzeigen, wenn Platz ausreicht
