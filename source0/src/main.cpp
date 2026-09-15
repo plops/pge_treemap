@@ -14,6 +14,35 @@
 #define OLC_PGE3_APPLICATION
 #include "olcPixelGameEngine3.h"
 
+// ----------------------------------------------------------------------------
+// Linux / X11 Idle Fix:
+// PGE3's Host_Linux_X11::StartSystem() runs:
+//     while (XPending(olc_Display)) XNextEvent(olc_Display, &xev);
+// When no events exist, XPending returns 0 without blocking, spinning the
+// main thread at 100% CPU.
+// By defining XPending with C linkage here (resolved dynamically over libX11),
+// we sleep 2ms when the event queue is empty, dropping CPU usage to ~0%.
+// ----------------------------------------------------------------------------
+#if defined(__linux__)
+extern "C" {
+    struct _XDisplay;
+    int XEventsQueued(struct _XDisplay* display, int mode);
+
+    int XPending(struct _XDisplay* display)
+    {
+        // QueuedAfterFlush = 2
+        int count = XEventsQueued(display, 2);
+        if (count == 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            // QueuedAlready = 0
+            count = XEventsQueued(display, 0);
+        }
+        return count;
+    }
+}
+#endif
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -65,7 +94,6 @@ Pixel HSLtoPixel(float h, float s, float l)
         static_cast<uint8_t>(f(4) * 255.0f)};
 }
 
-// Zero-allocation extension check
 Pixel GetColorForFilename(const std::string_view name)
 {
     const auto dotPos = name.rfind('.');
@@ -98,8 +126,8 @@ public:
     }
 
 private:
-    const vi2d m_screenSize      = {1280, 720};
-    const vf2d WORLD_CANVAS_SIZE = {1280.0f, 720.0f};
+    const vi2d m_screenSize      = {1920, 1080};
+    const vf2d WORLD_CANVAS_SIZE = {1920.0f, 1080.0f};
 
     SharedScanContext         m_shared;
     std::thread               m_scanThread;
@@ -111,6 +139,7 @@ private:
     const FileNode* m_hoveredNode  = nullptr;
     int             m_cleanFrames  = 0;
 
+    std::chrono::steady_clock::time_point m_lastFrameTime;
     std::chrono::steady_clock::time_point m_lastPublishTime;
     uint32_t                              m_filesSinceLastPublishCheck = 0;
     std::unique_ptr<FileNode>             m_workerRoot                 = nullptr;
@@ -118,14 +147,21 @@ private:
 public:
     bool OnUserCreate() override
     {
-        m_lastMousePos = mouse.GetPosition();
+        m_lastMousePos  = mouse.GetPosition();
+        m_lastFrameTime = std::chrono::steady_clock::now();
         StartBackgroundScan(fs::current_path());
         return true;
     }
 
     bool OnUserUpdate(float fElapsedTime) override
     {
-        // 1. Instant non-blocking tree swap & asynchronous destruction
+        // Reclaim worker thread once scanning is done
+        if (!m_shared.isScanning.load(std::memory_order_relaxed) && m_scanThread.joinable())
+        {
+            m_scanThread.join();
+        }
+
+        // 1. Instant non-blocking tree swap
         bool hasNewTree = false;
         if (m_shared.hasNewDataForRender.load(std::memory_order_relaxed))
         {
@@ -144,7 +180,7 @@ public:
             m_hoveredNode = nullptr;
         }
 
-        // 2. Determine activity state
+        // 2. Activity / Dirty detection
         const vi2d currentMousePos  = mouse.GetPosition();
         const bool mouseMoved       = (currentMousePos != m_lastMousePos);
         const bool mouseInteracting = mouse.GetButton(0).bHeld || mouse.GetButton(0).bPressed || mouse.GetButton(0).bReleased ||
@@ -165,11 +201,10 @@ public:
             ++m_cleanFrames;
         }
 
-        // When scan is done and scene is completely static for >2 frames,
-        // sleep to yield CPU and avoid re-rendering identical frames.
+        // Static scene sleep: avoid burning CPU redrawing identical frames
         if (m_cleanFrames > 2)
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
             return true;
         }
 
@@ -193,6 +228,16 @@ public:
 
         draw.WorldReset();
         RenderHUD();
+
+        // 4. Fallback frame rate limiter (~60 FPS) in case OpenGL driver ignores VSync
+        const auto now     = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - m_lastFrameTime);
+        constexpr auto targetFrameTime = std::chrono::microseconds(16666);
+        if (elapsed < targetFrameTime)
+        {
+            std::this_thread::sleep_for(targetFrameTime - elapsed);
+        }
+        m_lastFrameTime = std::chrono::steady_clock::now();
 
         return true;
     }
@@ -231,9 +276,13 @@ private:
             {
                 if (m_shared.abortScanRequested) return;
 
+                // Avoid infinite recursive loops on directory symlinks
+                std::error_code ec;
+                if (entry.is_symlink(ec)) continue;
+
                 auto child         = std::make_unique<FileNode>();
                 child->name        = entry.path().filename().string();
-                child->isDirectory = entry.is_directory();
+                child->isDirectory = entry.is_directory(ec);
 
                 FileNode* childPtr = child.get();
                 parentNode->children.push_back(std::move(child));
@@ -276,16 +325,13 @@ private:
     {
         if (!m_workerRoot) return;
 
-        // 1. Copy snapshot and accumulate sizes (skips 0-byte files)
         auto snapshot = DeepCopyTree(m_workerRoot.get());
         if (!snapshot || snapshot->sizeBytes == 0) return;
 
-        // 2. Compute layout entirely on the BACKGROUND thread
         snapshot->visualPos  = {0.0f, 0.0f};
         snapshot->visualSize = WORLD_CANVAS_SIZE;
         CalculateTreemapLayout(snapshot.get(), snapshot->visualPos, snapshot->visualSize);
 
-        // 3. Hand ready-to-render snapshot to UI
         {
             std::lock_guard lock(m_shared.treeMutex);
             m_shared.readyRenderTree      = std::move(snapshot);
@@ -367,7 +413,7 @@ private:
         }
         else
         {
-            float rowThickness = isLastRow ? rect.h : static_cast<float>(rowAreaSum / rect.w);
+            float rowThickness = isLastRow ? rect.h : static_cast<float>(rowAreaSum / rect.h);
             rowThickness       = std::clamp(rowThickness, 0.0f, rect.h);
 
             float currentX = rect.x;
@@ -594,7 +640,6 @@ private:
     {
         if (!node) return;
 
-        // Viewport frustum culling
         if (node->visualPos.x > viewMax.x || (node->visualPos.x + node->visualSize.x) < viewMin.x ||
             node->visualPos.y > viewMax.y || (node->visualPos.y + node->visualSize.y) < viewMin.y)
         {
@@ -604,7 +649,6 @@ private:
         const float screenW = node->visualSize.x * m_cameraZoom;
         const float screenH = node->visualSize.y * m_cameraZoom;
 
-        // Sub-pixel culling
         if (screenW < 1.0f || screenH < 1.0f)
         {
             return;
@@ -616,7 +660,6 @@ private:
         }
         else
         {
-            // If directory is smaller than 3px on screen, render flat rect instead of traversing thousands of hidden children
             if (screenW < 3.0f || screenH < 3.0f)
             {
                 draw.FilledRect(node->visualPos, node->visualSize, Pixel(40, 45, 55));
@@ -690,7 +733,7 @@ private:
 
 int main()
 {
-    PGEConfig config{.vScreenSize = {1280,720}, .vPixelSize = {1,1},.bVSync = True };
+    PGEConfig config{.vScreenSize = {1920,1080}, .vPixelSize = {1,1},.bVSync = True };
     config.bFullScreen = false;
     if (DiskTreemapAnalyzer demo; demo.Construct(config))
     {
