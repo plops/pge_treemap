@@ -1,0 +1,41 @@
+name: CMake Build GLFW gRPC Example 134
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'source0/**'
+      
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: sudo apt-get install -y cmake ninja-build libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev
+
+    - name: Get PGE3 header
+      run: wget https://raw.githubusercontent.com/OneLoneCoder/olcPixelGameEngine3/refs/heads/main/olcPixelGameEngine3.h
+
+     - name: Create build directory
+       run: mkdir build
+
+#    - name: Setup tmate session
+#      uses: mxschmitt/action-tmate@v3
+
+    - name: Configure CMake
+      run: cmake -S source0 -B build -G Ninja  -DENABLE_ASAN:BOOL=OFF -DENABLE_LSAN:BOOL=OFF -DENABLE_UBSAN:BOOL=OFF -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build with Ninja
+      run: ninja -C build
+
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: pge_treemap
+        path: build/pge_treemap
