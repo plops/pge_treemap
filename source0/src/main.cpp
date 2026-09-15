@@ -25,7 +25,7 @@ namespace {
         std::string name;
         uintmax_t sizeBytes = 0;
         bool isDirectory = false;
-        std::vector<std::unique_ptr<FileNode> > children;
+        std::vector<std::unique_ptr<FileNode>> children;
 
         // Koordinaten im virtuellen Welt-Raum (wird vom Treemap-Algorithmus berechnet)
         vf2d visualPos = {0.0f, 0.0f};
@@ -35,12 +35,12 @@ namespace {
 } // namespace
 
 // ============================================================================
-// 2. THREAD-SHARED STATE (Klar getrennt vom UI-/Render-Zustand)
+// 2. THREAD-SHARED STATE
 // ============================================================================
 
 namespace {
     struct SharedScanContext {
-        // Dieser Mutex schützt AUSSCHLIESSLICH den Zugriff auf den Datenbaum
+        // Schützt die Übergabe des fertigen Snapshots an den UI-Thread
         mutable std::mutex treeMutex;
         std::unique_ptr<FileNode> rootNode = nullptr;
         std::string currentPathInspected;
@@ -51,7 +51,7 @@ namespace {
         std::atomic<uintmax_t> totalFilesScanned{0};
         std::atomic<uintmax_t> totalBytesScanned{0};
 
-        // Signalisiert dem Render-Thread, dass neue Daten zur Verfügung stehen
+        // Signalisiert dem Render-Thread, dass ein neuer Snapshot bereitsteht
         std::atomic<bool> hasNewDataForLayout{false};
     };
 } // namespace
@@ -114,7 +114,6 @@ namespace {
         return {120, 130, 140}; // Dateien ohne Endung
     }
 
-
     class DiskTreemapAnalyzer : public PixelGameEngine {
     public:
         DiskTreemapAnalyzer() {
@@ -122,7 +121,6 @@ namespace {
         }
 
         ~DiskTreemapAnalyzer() override {
-            // Hintergrund-Thread sauber stoppen
             m_shared.abortScanRequested = true;
             if (m_scanThread.joinable()) {
                 m_scanThread.join();
@@ -132,7 +130,7 @@ namespace {
     private:
         // --- Bildschirm- & Canvas-Konfiguration ---
         const vi2d m_screenSize = {1280, 720};
-        const vf2d WORLD_CANVAS_SIZE = {1000.0f, 1000.0f};
+        const vf2d WORLD_CANVAS_SIZE = {1280.0f, 720.0f};
 
         // --- Threading & Daten ---
         SharedScanContext m_shared;
@@ -145,13 +143,13 @@ namespace {
         vi2d m_lastMousePos = {0, 0};
         const FileNode *m_hoveredNode = nullptr;
 
-        // Aktualisierungsintervall für das Layout während des Scans
-        std::chrono::steady_clock::time_point m_lastLayoutUpdate;
-        const std::chrono::milliseconds LAYOUT_REFRESH_RATE{400};
+        // Zeitstempel der letzten Worker-Veröffentlichung
+        std::chrono::steady_clock::time_point m_lastPublishTime;
+        uint32_t m_filesSinceLastPublishCheck = 0;
+        std::unique_ptr<FileNode> m_workerRoot = nullptr;
 
     public:
         bool OnUserCreate() override {
-            m_lastLayoutUpdate = std::chrono::steady_clock::now();
             m_lastMousePos = mouse.GetPosition();
 
             // Scan im aktuellen Arbeitsverzeichnis starten
@@ -168,12 +166,12 @@ namespace {
             // --------------------------------------------------------------------
             draw.Clear(Pixel(20, 24, 30));
 
-            // 1. Affine Welt-Transformation auf die PGE3-Draw-Pipeline anwenden
+            // Welt-Transformation anwenden
             draw.WorldReset();
             draw.WorldScale({m_cameraZoom, m_cameraZoom});
             draw.WorldOffset(m_cameraOffset);
 
-            // 2. Treemap rekursiv zeichnen
+            // Treemap rekursiv zeichnen
             m_hoveredNode = nullptr;
             const vf2d mouseWorld = draw.ScreenToWorld(mouse.GetPosition());
 
@@ -181,7 +179,7 @@ namespace {
                 RenderNode(m_renderRoot.get(), mouseWorld);
             }
 
-            // 3. UI-HUD im Screen-Space zeichnen (Transformationen zurücksetzen)
+            // HUD im Screen-Space rendern
             draw.WorldReset();
             RenderHUD();
 
@@ -190,7 +188,7 @@ namespace {
 
     private:
         // ========================================================================
-        // WORKER-THREAD: DATEISYSTEM-SCAN
+        // WORKER-THREAD: DATEISYSTEM-SCAN MIT LIVE-SNAPSHOTS
         // ========================================================================
         void StartBackgroundScan(const fs::path &targetDirectory) {
             if (m_shared.isScanning) return;
@@ -199,25 +197,18 @@ namespace {
             m_shared.abortScanRequested = false;
 
             m_scanThread = std::thread([this, targetDirectory]() {
-                auto root = std::make_unique<FileNode>();
-                root->path = targetDirectory;
-                root->name = targetDirectory.filename().string();
-                root->isDirectory = true;
+                m_workerRoot = std::make_unique<FileNode>();
+                m_workerRoot->path = targetDirectory;
+                m_workerRoot->name = targetDirectory.filename().string();
+                m_workerRoot->isDirectory = true;
 
-                {
-                    std::lock_guard lock(m_shared.treeMutex);
-                    m_shared.rootNode = std::make_unique<FileNode>();
-                    m_shared.rootNode->path = root->path;
-                    m_shared.rootNode->name = root->name;
-                    m_shared.rootNode->isDirectory = true;
-                }
+                m_lastPublishTime = std::chrono::steady_clock::now();
+                m_filesSinceLastPublishCheck = 0;
 
-                ScanDirectoryRecursive(targetDirectory, root.get());
+                ScanDirectoryRecursive(targetDirectory, m_workerRoot.get());
 
                 if (!m_shared.abortScanRequested) {
-                    std::lock_guard lock(m_shared.treeMutex);
-                    m_shared.rootNode = std::move(root);
-                    m_shared.hasNewDataForLayout = true;
+                    PublishSnapshot(targetDirectory.string());
                 }
 
                 m_shared.isScanning = false;
@@ -226,8 +217,7 @@ namespace {
 
         void ScanDirectoryRecursive(const fs::path &currentPath, FileNode *parentNode) {
             try {
-                for (const auto &entry: fs::directory_iterator(currentPath,
-                                                               fs::directory_options::skip_permission_denied)) {
+                for (const auto &entry : fs::directory_iterator(currentPath, fs::directory_options::skip_permission_denied)) {
                     if (m_shared.abortScanRequested) return;
 
                     auto child = std::make_unique<FileNode>();
@@ -235,31 +225,48 @@ namespace {
                     child->name = entry.path().filename().string();
                     child->isDirectory = entry.is_directory();
 
-                    if (child->isDirectory) {
-                        ScanDirectoryRecursive(entry.path(), child.get());
-                    } else {
-                        try {
-                            child->sizeBytes = entry.file_size();
-                        } catch (...) {
-                            child->sizeBytes = 0;
-                        }
-                    }
-
-                    parentNode->sizeBytes = parentNode->sizeBytes + child->sizeBytes;
-
-                    ++m_shared.totalFilesScanned;
-                    m_shared.totalBytesScanned += child->sizeBytes;
-
+                    FileNode *childPtr = child.get();
+                    // Knoten SOFORT an den Parent anhängen, damit der Baum im Snapshot existiert
                     parentNode->children.push_back(std::move(child));
 
-                    if (m_shared.totalFilesScanned % 25000 == 0) {
-                        std::lock_guard lock(m_shared.treeMutex);
-                        m_shared.currentPathInspected = entry.path().string();
-                        m_shared.hasNewDataForLayout = true;
+                    if (childPtr->isDirectory) {
+                        ScanDirectoryRecursive(entry.path(), childPtr);
+                    } else {
+                        try {
+                            childPtr->sizeBytes = entry.file_size();
+                        } catch (...) {
+                            childPtr->sizeBytes = 0;
+                        }
+                        m_shared.totalBytesScanned += childPtr->sizeBytes;
+                        ++m_shared.totalFilesScanned;
+                    }
+
+                    // Regelmäßige Snapshots veröffentlichen (~alle 250ms)
+                    if (++m_filesSinceLastPublishCheck >= 25000) {
+                        m_filesSinceLastPublishCheck = 0;
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now - m_lastPublishTime >= std::chrono::milliseconds(250)) {
+                            m_lastPublishTime = now;
+                            PublishSnapshot(entry.path().string());
+                        }
                     }
                 }
             } catch (...) {
-                // Ignoriere unzureichende Berechtigungen auf Linux
+                // Berechtigungsfehler ignorieren
+            }
+        }
+
+        void PublishSnapshot(const std::string &currentInspectedPath) {
+            if (!m_workerRoot) return;
+
+            // Deep-Copy erstellt eine thread-sichere Kopie und summiert Größen rekursiv auf
+            auto snapshot = DeepCopyTree(m_workerRoot.get());
+
+            {
+                std::lock_guard lock(m_shared.treeMutex);
+                m_shared.rootNode = std::move(snapshot);
+                m_shared.currentPathInspected = currentInspectedPath;
+                m_shared.hasNewDataForLayout = true;
             }
         }
 
@@ -267,27 +274,20 @@ namespace {
         // LAYOUT-GENERIERUNG
         // ========================================================================
         void CheckAndRebuildLayout() {
-            const auto now = std::chrono::steady_clock::now();
+            if (!m_shared.hasNewDataForLayout) return;
 
-            if (const bool timeElapsed = (now - m_lastLayoutUpdate) > LAYOUT_REFRESH_RATE;
-                m_shared.hasNewDataForLayout && (timeElapsed || !m_shared.isScanning)) {
+            std::unique_ptr<FileNode> treeSnapshot = nullptr;
+            {
+                std::lock_guard lock(m_shared.treeMutex);
+                treeSnapshot = std::move(m_shared.rootNode);
                 m_shared.hasNewDataForLayout = false;
-                m_lastLayoutUpdate = now;
+            }
 
-                std::unique_ptr<FileNode> treeSnapshot = nullptr;
-                {
-                    std::lock_guard lock(m_shared.treeMutex);
-                    if (m_shared.rootNode) {
-                        treeSnapshot = DeepCopyTree(m_shared.rootNode.get());
-                    }
-                }
-
-                if (treeSnapshot) {
-                    treeSnapshot->visualPos = {0.0f, 0.0f};
-                    treeSnapshot->visualSize = WORLD_CANVAS_SIZE;
-                    CalculateTreemapLayout(treeSnapshot.get(), treeSnapshot->visualPos, treeSnapshot->visualSize, 0);
-                    m_renderRoot = std::move(treeSnapshot);
-                }
+            if (treeSnapshot && treeSnapshot->sizeBytes > 0) {
+                treeSnapshot->visualPos = {0.0f, 0.0f};
+                treeSnapshot->visualSize = WORLD_CANVAS_SIZE;
+                CalculateTreemapLayout(treeSnapshot.get(), treeSnapshot->visualPos, treeSnapshot->visualSize, 0);
+                m_renderRoot = std::move(treeSnapshot);
             }
         }
 
@@ -301,10 +301,16 @@ namespace {
 
             if (node->children.empty()) return;
 
+            // Sortierung nach Dateigröße (absteigend) verhindert visuelle Artefakte und Flickern
+            std::sort(node->children.begin(), node->children.end(),
+                      [](const std::unique_ptr<FileNode> &a, const std::unique_ptr<FileNode> &b) {
+                          return a->sizeBytes > b->sizeBytes;
+                      });
+
             const bool splitVertical = size.x >= size.y;
             float currentOffset = 0.0f;
 
-            for (auto &child: node->children) {
+            for (auto &child : node->children) {
                 if (child->sizeBytes == 0) continue;
 
                 const float ratio = static_cast<float>(child->sizeBytes) / static_cast<float>(node->sizeBytes);
@@ -325,16 +331,27 @@ namespace {
             }
         }
 
-
+        // Kopiert den Baum und berechnet die Summen-Größe jedes Verzeichnisses live
         static std::unique_ptr<FileNode> DeepCopyTree(const FileNode *source) {
             if (!source) return nullptr;
+
             auto copy = std::make_unique<FileNode>();
             copy->path = source->path;
             copy->name = source->name;
-            copy->sizeBytes = source->sizeBytes;
             copy->isDirectory = source->isDirectory;
-            for (const auto &child: source->children) {
-                copy->children.push_back(DeepCopyTree(child.get()));
+
+            if (!source->isDirectory) {
+                copy->sizeBytes = source->sizeBytes;
+            } else {
+                copy->sizeBytes = 0;
+                copy->children.reserve(source->children.size());
+                for (const auto &child : source->children) {
+                    auto childCopy = DeepCopyTree(child.get());
+                    if (childCopy && childCopy->sizeBytes > 0) {
+                        copy->sizeBytes += childCopy->sizeBytes;
+                        copy->children.push_back(std::move(childCopy));
+                    }
+                }
             }
             return copy;
         }
@@ -361,7 +378,6 @@ namespace {
                 m_cameraOffset += mouseAfterZoom - mouseBeforeZoom;
             }
 
-            // Reset-Kamera mit Leertaste
             if (keyboard.GetKey(Key::SPACE).bPressed) {
                 m_cameraOffset = {0.0f, 0.0f};
                 m_cameraZoom = 1.0f;
@@ -457,6 +473,13 @@ namespace {
             if (m_hoveredNode) {
                 const std::string hoverInfo = m_hoveredNode->name + " (" + FormatBytes(m_hoveredNode->sizeBytes) + ")";
                 draw.String({10.0f, 26.0f}, hoverInfo, Colour::WHITE);
+            } else if (m_shared.isScanning) {
+                std::string inspecting;
+                {
+                    std::lock_guard lock(m_shared.treeMutex);
+                    inspecting = m_shared.currentPathInspected;
+                }
+                draw.String({10.0f, 26.0f}, "Scanning: " + inspecting, Colour::GREY);
             } else {
                 draw.String({10.0f, 26.0f}, "Pan: Left/Middle Drag | Zoom: Wheel | Reset: Space", Colour::DARK_GREY);
             }
