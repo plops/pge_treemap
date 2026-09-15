@@ -241,11 +241,11 @@ namespace {
                         ++m_shared.totalFilesScanned;
                     }
 
-                    // Regelmäßige Snapshots veröffentlichen (~alle 250ms)
+                    // Regelmäßige Snapshots veröffentlichen (~alle 2500ms)
                     if (++m_filesSinceLastPublishCheck >= 25000) {
                         m_filesSinceLastPublishCheck = 0;
                         const auto now = std::chrono::steady_clock::now();
-                        if (now - m_lastPublishTime >= std::chrono::milliseconds(250)) {
+                        if (now - m_lastPublishTime >= std::chrono::milliseconds(2500)) {
                             m_lastPublishTime = now;
                             PublishSnapshot(entry.path().string());
                         }
