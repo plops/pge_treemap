@@ -109,6 +109,7 @@ private:
     float           m_cameraZoom   = 1.0f;
     vi2d            m_lastMousePos = {0, 0};
     const FileNode* m_hoveredNode  = nullptr;
+    int             m_cleanFrames  = 0;
 
     std::chrono::steady_clock::time_point m_lastPublishTime;
     uint32_t                              m_filesSinceLastPublishCheck = 0;
@@ -124,9 +125,8 @@ public:
 
     bool OnUserUpdate(float fElapsedTime) override
     {
-        HandleInput(fElapsedTime);
-
         // 1. Instant non-blocking tree swap & asynchronous destruction
+        bool hasNewTree = false;
         if (m_shared.hasNewDataForRender.load(std::memory_order_relaxed))
         {
             std::unique_ptr<FileNode> newTree = nullptr;
@@ -138,24 +138,57 @@ public:
             std::swap(m_renderRoot, newTree);
             if (newTree)
             {
-                // Destroy previous tree on a background thread to prevent UI stutter
-                std::thread([old = std::move(newTree)]() {
-                }).detach();
+                std::thread([old = std::move(newTree)]() {}).detach();
             }
+            hasNewTree    = true;
+            m_hoveredNode = nullptr;
         }
 
-        // 2. Rendering
+        // 2. Determine activity state
+        const vi2d currentMousePos  = mouse.GetPosition();
+        const bool mouseMoved       = (currentMousePos != m_lastMousePos);
+        const bool mouseInteracting = mouse.GetButton(0).bHeld || mouse.GetButton(0).bPressed || mouse.GetButton(0).bReleased ||
+                                      mouse.GetButton(1).bHeld || mouse.GetButton(1).bPressed || mouse.GetButton(1).bReleased ||
+                                      mouse.GetButton(2).bHeld || mouse.GetButton(2).bPressed || mouse.GetButton(2).bReleased ||
+                                      mouse.GetWheel() != 0;
+        const bool keyInteracting = keyboard.GetKey(Key::SPACE).bPressed || keyboard.GetKey(Key::SPACE).bHeld;
+        const bool isScanning     = m_shared.isScanning.load(std::memory_order_relaxed);
+
+        const bool isDirty = isScanning || hasNewTree || mouseMoved || mouseInteracting || keyInteracting;
+
+        if (isDirty)
+        {
+            m_cleanFrames = 0;
+        }
+        else
+        {
+            ++m_cleanFrames;
+        }
+
+        // When scan is done and scene is completely static for >2 frames,
+        // sleep to yield CPU and avoid re-rendering identical frames.
+        if (m_cleanFrames > 2)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            return true;
+        }
+
+        HandleInput(fElapsedTime);
+
+        // 3. Rendering
         draw.Clear(Pixel(20, 24, 30));
         draw.WorldReset();
         draw.WorldScale({m_cameraZoom, m_cameraZoom});
         draw.WorldOffset(m_cameraOffset);
 
-        m_hoveredNode         = nullptr;
         const vf2d mouseWorld = draw.ScreenToWorld(mouse.GetPosition());
+        m_hoveredNode         = m_renderRoot ? FindHoveredNode(m_renderRoot.get(), mouseWorld) : nullptr;
 
         if (m_renderRoot)
         {
-            RenderNode(m_renderRoot.get(), mouseWorld);
+            const vf2d viewMin = draw.ScreenToWorld({0, 0});
+            const vf2d viewMax = draw.ScreenToWorld(m_screenSize);
+            RenderNode(m_renderRoot.get(), viewMin, viewMax);
         }
 
         draw.WorldReset();
@@ -300,7 +333,6 @@ private:
 
         if (rect.w >= rect.h)
         {
-            // Vertical strip placed along height rect.h
             float rowThickness = isLastRow ? rect.w : static_cast<float>(rowAreaSum / rect.h);
             rowThickness       = std::clamp(rowThickness, 0.0f, rect.w);
 
@@ -335,7 +367,6 @@ private:
         }
         else
         {
-            // Horizontal strip placed along width rect.w
             float rowThickness = isLastRow ? rect.h : static_cast<float>(rowAreaSum / rect.w);
             rowThickness       = std::clamp(rowThickness, 0.0f, rect.h);
 
@@ -376,7 +407,6 @@ private:
         node->visualPos  = pos;
         node->visualSize = size;
 
-        // Stop subdividing if container is sub-pixel (< 0.5px) or leaf
         if (size.x < 0.5f || size.y < 0.5f || node->children.empty()) return;
 
         std::ranges::sort(node->children,
@@ -439,7 +469,6 @@ private:
                 }
                 else
                 {
-                    // Adding candidate worsened aspect ratio; flush current row
                     currentRow.pop_back();
                     LayoutRow(currentRow, currentRowAreaSum, rect, false);
                     currentRow.clear();
@@ -485,7 +514,6 @@ private:
             copy->children.reserve(source->children.size());
             for (const auto& child: source->children)
             {
-                // Ignore 0-byte items completely
                 if (child->sizeBytes == 0 && !child->isDirectory) continue;
 
                 if (auto childCopy = DeepCopyTree(child.get()); childCopy && childCopy->sizeBytes > 0)
@@ -498,7 +526,7 @@ private:
         return copy;
     }
 
-    void HandleInput(float fElapsedTime)
+    void HandleInput(float)
     {
         if (mouse.GetButton(0).bHeld || mouse.GetButton(2).bHeld)
         {
@@ -543,11 +571,41 @@ private:
         draw.Rect(pos, size, Pixel(15, 15, 20, 200));
     }
 
-    void RenderNode(const FileNode* node, const vf2d& mouseWorld)
+    static const FileNode* FindHoveredNode(const FileNode* node, const vf2d& pt)
+    {
+        if (!node || node->visualSize.x <= 0.0f || node->visualSize.y <= 0.0f) return nullptr;
+        if (pt.x < node->visualPos.x || pt.x > (node->visualPos.x + node->visualSize.x) ||
+            pt.y < node->visualPos.y || pt.y > (node->visualPos.y + node->visualSize.y))
+        {
+            return nullptr;
+        }
+
+        for (const auto& child: node->children)
+        {
+            if (const auto* hit = FindHoveredNode(child.get(), pt))
+            {
+                return hit;
+            }
+        }
+        return node;
+    }
+
+    void RenderNode(const FileNode* node, const vf2d& viewMin, const vf2d& viewMax)
     {
         if (!node) return;
 
-        if (node->visualSize.x * m_cameraZoom < 1.0f || node->visualSize.y * m_cameraZoom < 1.0f)
+        // Viewport frustum culling
+        if (node->visualPos.x > viewMax.x || (node->visualPos.x + node->visualSize.x) < viewMin.x ||
+            node->visualPos.y > viewMax.y || (node->visualPos.y + node->visualSize.y) < viewMin.y)
+        {
+            return;
+        }
+
+        const float screenW = node->visualSize.x * m_cameraZoom;
+        const float screenH = node->visualSize.y * m_cameraZoom;
+
+        // Sub-pixel culling
+        if (screenW < 1.0f || screenH < 1.0f)
         {
             return;
         }
@@ -558,21 +616,23 @@ private:
         }
         else
         {
+            // If directory is smaller than 3px on screen, render flat rect instead of traversing thousands of hidden children
+            if (screenW < 3.0f || screenH < 3.0f)
+            {
+                draw.FilledRect(node->visualPos, node->visualSize, Pixel(40, 45, 55));
+                return;
+            }
+
             for (const auto& child: node->children)
             {
-                RenderNode(child.get(), mouseWorld);
+                RenderNode(child.get(), viewMin, viewMax);
             }
             draw.Rect(node->visualPos, node->visualSize, Pixel(0, 0, 0, 160));
         }
 
-        if (mouseWorld.x >= node->visualPos.x && mouseWorld.x <= (node->visualPos.x + node->visualSize.x) && mouseWorld.y >= node->visualPos.y && mouseWorld.y <= (node->visualPos.y + node->visualSize.y))
+        if (screenW > 70.0f && screenH > 22.0f)
         {
-            if (!m_hoveredNode) m_hoveredNode = node;
-        }
-
-        if (node->visualSize.x * m_cameraZoom > 70.0f && node->visualSize.y * m_cameraZoom > 22.0f)
-        {
-            float invZoom = 1.0f / m_cameraZoom;
+            const float invZoom = 1.0f / m_cameraZoom;
             draw.String(node->visualPos + vf2d{5.0f, 5.0f}, node->name, Colour::BLACK, {invZoom, invZoom});
             draw.String(node->visualPos + vf2d{4.0f, 4.0f}, node->name, Colour::WHITE, {invZoom, invZoom});
         }
@@ -630,7 +690,9 @@ private:
 
 int main()
 {
-    if (DiskTreemapAnalyzer demo; demo.Construct({1280, 720}, {1, 1}, false))
+    PGEConfig config{.vScreenSize = {1280,720}, .vPixelSize = {1,1},.bVSync = True };
+    config.bFullScreen = false;
+    if (DiskTreemapAnalyzer demo; demo.Construct(config))
     {
         demo.Start();
     }
