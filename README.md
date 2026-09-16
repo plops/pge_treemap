@@ -28,12 +28,12 @@ A fast, interactive disk space visualizer built in modern C++23 and powered by *
 
 ## Controls
 
-| Action | Control |
-|---|---|
-| **Pan / Move Canvas** | `Left Click` or `Middle Click` + Drag |
-| **Zoom in / out** | `Mouse Wheel` (centered around mouse pointer) |
-| **Reset View** | `Spacebar` |
-| **Inspect Node** | Hover mouse over any block |
+| Action                | Control                                       |
+|-----------------------|-----------------------------------------------|
+| **Pan / Move Canvas** | `Left Click` or `Middle Click` + Drag         |
+| **Zoom in / out**     | `Mouse Wheel` (centered around mouse pointer) |
+| **Reset View**        | `Spacebar`                                    |
+| **Inspect Node**      | Hover mouse over any block                    |
 
 ---
 
