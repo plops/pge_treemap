@@ -120,7 +120,7 @@ public:
         m_workers.clear();
     }
 
-    template <typename F>
+    template<typename F>
     void Enqueue(F&& f)
     {
         {
@@ -214,9 +214,9 @@ private:
     const vi2d m_screenSize      = {1920, 1080};
     const vf2d WORLD_CANVAS_SIZE = {1920.0f, 1080.0f};
 
-    SharedScanContext            m_shared;
-    std::thread                  m_scanThread;
-    std::unique_ptr<FileNode>    m_renderRoot = nullptr;
+    SharedScanContext                 m_shared;
+    std::thread                       m_scanThread;
+    std::unique_ptr<FileNode>         m_renderRoot       = nullptr;
     std::unique_ptr<LayoutThreadPool> m_layoutThreadPool = nullptr;
 
     // ------------------------------------------------------------------------
@@ -278,10 +278,7 @@ public:
         // 2. Activity / Dirty detection
         const vi2d currentMousePos  = mouse.GetPosition();
         const bool mouseMoved       = (currentMousePos != m_lastMousePos);
-        const bool mouseInteracting = mouse.GetButton(0).bHeld || mouse.GetButton(0).bPressed || mouse.GetButton(0).bReleased ||
-                                      mouse.GetButton(1).bHeld || mouse.GetButton(1).bPressed || mouse.GetButton(1).bReleased ||
-                                      mouse.GetButton(2).bHeld || mouse.GetButton(2).bPressed || mouse.GetButton(2).bReleased ||
-                                      mouse.GetWheel() != 0;
+        const bool mouseInteracting = mouse.GetButton(0).bHeld || mouse.GetButton(0).bPressed || mouse.GetButton(0).bReleased || mouse.GetButton(1).bHeld || mouse.GetButton(1).bPressed || mouse.GetButton(1).bReleased || mouse.GetButton(2).bHeld || mouse.GetButton(2).bPressed || mouse.GetButton(2).bReleased || mouse.GetWheel() != 0;
         const bool keyInteracting   = keyboard.GetKey(Key::SPACE).bPressed || keyboard.GetKey(Key::SPACE).bHeld;
         const bool isScanning       = m_shared.isScanning.load(std::memory_order_relaxed);
 
@@ -559,7 +556,7 @@ private:
         }
         if (totalBytes == 0) return eligibleChildren;
 
-        const double totalArea = static_cast<double>(node->visualSize.x) * static_cast<double>(node->visualSize.y);
+        const double              totalArea = static_cast<double>(node->visualSize.x) * static_cast<double>(node->visualSize.y);
         std::vector<SquarifyItem> items;
         items.reserve(node->children.size());
 
@@ -579,7 +576,7 @@ private:
 
         if (items.empty()) return eligibleChildren;
 
-        LayoutRect rect = {.x = node->visualPos.x, .y = node->visualPos.y, .w = node->visualSize.x, .h = node->visualSize.y};
+        LayoutRect                rect = {.x = node->visualPos.x, .y = node->visualPos.y, .w = node->visualSize.x, .h = node->visualSize.y};
         std::vector<SquarifyItem> currentRow;
         double                    currentRowAreaSum = 0.0;
 
@@ -698,9 +695,7 @@ private:
             if (m_shared.abortScanRequested.load(std::memory_order_relaxed)) return;
 
             // Fork if child has enough work and active tasks do not saturate queue
-            const bool shouldFork = allowFork &&
-                                    (child->children.size() >= 4) &&
-                                    (m_layoutActiveTaskCount.load(std::memory_order_relaxed) < static_cast<int64_t>(maxParallelTasks));
+            const bool shouldFork = allowFork && (child->children.size() >= 4) && (m_layoutActiveTaskCount.load(std::memory_order_relaxed) < static_cast<int64_t>(maxParallelTasks));
 
             if (shouldFork && m_layoutThreadPool)
             {
