@@ -199,6 +199,7 @@ sudo apt-get install -y cmake ninja-build libx11-dev libxi-dev libgl1-mesa-dev l
 # Clone and configure
 git clone https://github.com/plops/pge_treemap.git
 cd pge_treemap
+# Also download PGE3 header (see Github action in .github folder)
 cmake -S source0 -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
 # Build
@@ -219,14 +220,4 @@ ninja -C build
 
 # Show help
 ./build/pge_treemap --help
-```
-
-### Controls
-
-| Action | Control |
-|---|---|
-| **Pan Canvas** | `Left Click` or `Middle Click` + Drag |
-| **Zoom in / out** | `Mouse Wheel` (cursor-centric) |
-| **Reset Camera** | `Spacebar` |
-| **Inspect Node** | Hover over any file or directory |
 ```
