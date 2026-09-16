@@ -50,3 +50,23 @@ wget https://github.com/plops/pge_treemap/releases/latest/download/pge_treemap
 # Make executable and run
 chmod +x pge_treemap
 ./pge_treemap
+
+
+## Source Code Structure
+
+
+The codebase has been refactored into self-contained files prefixed with numerical increments (`000_`, `010_`, `020_`, ...), allowing future components (such as file filters, search indexes, exporters, or custom renderers) to be dropped in between (e.g. `015_...`, `045_...`) without renaming existing files.
+
+---
+
+### File Overview
+* `src/000_platform_fix.hpp` — Linux/X11 idle CPU spin interceptor.
+* `src/010_types.hpp` — Core data structures (`FileNode`, `SharedScanContext`, `LayoutRect`, `SquarifyItem`).
+* `src/020_color_utils.hpp` — Color hashing, HSL conversions, and byte formatting.
+* `src/030_thread_pool.hpp` — General-purpose task thread pool.
+* `src/040_file_watcher.hpp` — Dedicated Linux `inotify` watcher with debounced event processing and fallback stub.
+* `src/050_treemap_layout.hpp` — Squarified treemap layout engine with parallel subtree recursion.
+* `src/060_scanner.hpp` — Recursive directory scanner, tree cloner, and snapshot publisher.
+* `src/070_treemap_app.hpp` — PixelGameEngine application, cushion rendering, camera panning/zooming, and HUD.
+* `src/080_cli.hpp` — Command-line argument parsing and directory validation.
+* `src/090_main.cpp` — Engine entry point defining `OLC_PGE3_APPLICATION`.
