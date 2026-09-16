@@ -1,4 +1,4 @@
-for i in source0/{CMakeLists.txt,src/main.cpp} .github/workflows/*.yml
+for i in README.md source0/{CMakeLists.txt,src/*.hpp,src/*.cpp} .github/workflows/*.yml
 do
     echo "// start of "$i
     cat $i

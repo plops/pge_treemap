@@ -23,7 +23,8 @@ class DirectoryScanner
 public:
     DirectoryScanner(fs::path targetPath, SharedScanContext& shared, LayoutThreadPool& layoutPool,
                      FileWatcher& watcher, const vf2d canvasSize)
-        : m_targetPath(std::move(targetPath)), m_shared(shared), m_layoutPool(layoutPool), m_watcher(watcher), m_canvasSize(canvasSize)
+        : m_targetPath(std::move(targetPath)), m_shared(shared), m_layoutPool(layoutPool),
+          m_watcher(watcher), m_canvasSize(canvasSize)
     {
         m_workerThread = std::thread([this]() { WorkerLoop(); });
     }
@@ -37,7 +38,7 @@ public:
     {
         {
             std::lock_guard lock(m_mutex);
-            m_scanRequested = false;
+            m_stopRequested = true;
         }
         m_cv.notify_all();
 
@@ -90,15 +91,18 @@ public:
 private:
     void WorkerLoop()
     {
-        while (!m_shared.abortScanRequested)
+        while (true)
         {
             {
                 std::unique_lock lock(m_mutex);
                 m_cv.wait(lock, [this]() {
-                    return m_shared.abortScanRequested || m_scanRequested;
+                    return m_stopRequested || m_shared.abortScanRequested.load(std::memory_order_relaxed) || m_scanRequested;
                 });
 
-                if (m_shared.abortScanRequested) break;
+                if (m_stopRequested || m_shared.abortScanRequested.load(std::memory_order_relaxed))
+                {
+                    break;
+                }
                 m_scanRequested = false;
             }
 
@@ -122,7 +126,7 @@ private:
             m_watcher.AddWatch(m_targetPath);
             ScanDirectoryRecursive(m_targetPath, m_workerRoot.get());
 
-            if (!m_shared.abortScanRequested)
+            if (!m_shared.abortScanRequested.load(std::memory_order_relaxed) && !m_stopRequested)
             {
                 PublishSnapshot(m_targetPath.string());
             }
@@ -137,7 +141,7 @@ private:
             for (const auto& entry:
                  fs::directory_iterator(currentPath, fs::directory_options::skip_permission_denied))
             {
-                if (m_shared.abortScanRequested) return;
+                if (m_shared.abortScanRequested.load(std::memory_order_relaxed) || m_stopRequested) return;
 
                 std::error_code ec;
                 if (entry.is_symlink(ec)) continue;
@@ -159,7 +163,8 @@ private:
                     try
                     {
                         childPtr->sizeBytes = entry.file_size();
-                    } catch (...)
+                    }
+                    catch (...)
                     {
                         childPtr->sizeBytes = 0;
                     }
@@ -179,17 +184,19 @@ private:
                     }
                 }
             }
-        } catch (...)
+        }
+        catch (...)
         {
         }
     }
 
     void PublishSnapshot(const std::string& currentInspectedPath) const
     {
-        if (!m_workerRoot || m_shared.abortScanRequested) return;
+        if (!m_workerRoot || m_shared.abortScanRequested.load(std::memory_order_relaxed) || m_stopRequested) return;
 
         auto snapshot = DeepCopyTree(m_workerRoot.get());
-        if (!snapshot || snapshot->sizeBytes == 0 || m_shared.abortScanRequested) return;
+        if (!snapshot || snapshot->sizeBytes == 0 ||
+            m_shared.abortScanRequested.load(std::memory_order_relaxed) || m_stopRequested) return;
 
         snapshot->visualPos  = {0.0f, 0.0f};
         snapshot->visualSize = m_canvasSize;
@@ -197,7 +204,7 @@ private:
         TreemapLayout::CalculateParallel(snapshot.get(), snapshot->visualPos, snapshot->visualSize,
                                          &m_layoutPool, m_shared.abortScanRequested);
 
-        if (m_shared.abortScanRequested) return;
+        if (m_shared.abortScanRequested.load(std::memory_order_relaxed) || m_stopRequested) return;
 
         {
             std::lock_guard lock(m_shared.readySnapshotMutex);
@@ -217,6 +224,7 @@ private:
     std::mutex              m_mutex;
     std::condition_variable m_cv;
     bool                    m_scanRequested = true;
+    bool                    m_stopRequested = false;
 
     std::unique_ptr<FileNode>             m_workerRoot = nullptr;
     std::chrono::steady_clock::time_point m_lastPublishTime;

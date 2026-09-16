@@ -83,14 +83,15 @@ public:
 #if defined(HAS_INOTIFY)
         if (m_inotifyFd < 0) return;
 
-        std::error_code   ec;
-        const fs::path    canon   = fs::weakly_canonical(p, ec);
+        std::error_code ec;
+        const fs::path  canon = fs::weakly_canonical(p, ec);
         const std::string pathStr = (!ec) ? canon.string() : p.lexically_normal().string();
 
         std::lock_guard lock(m_watchMutex);
         if (m_pathToWd.contains(pathStr)) return;
 
-        constexpr uint32_t flags = IN_MODIFY | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_ATTRIB;
+        constexpr uint32_t flags = IN_MODIFY | IN_CREATE | IN_DELETE | IN_DELETE_SELF |
+                                   IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_ATTRIB;
         if (const int wd = inotify_add_watch(m_inotifyFd, pathStr.c_str(), flags); wd >= 0)
         {
             m_wdToPath[wd]      = pathStr;
@@ -110,18 +111,15 @@ public:
         if (!fs::exists(rootPath, ec) || !fs::is_directory(rootPath, ec)) return;
 
         AddWatch(rootPath);
-        try
+        for (auto it = fs::recursive_directory_iterator(rootPath, fs::directory_options::skip_permission_denied, ec);
+             it != fs::recursive_directory_iterator();
+             it.increment(ec))
         {
-            for (const auto& entry:
-                 fs::recursive_directory_iterator(rootPath, fs::directory_options::skip_permission_denied, ec))
+            if (ec) continue;
+            if (it->is_directory(ec))
             {
-                if (entry.is_directory(ec))
-                {
-                    AddWatch(entry.path());
-                }
+                AddWatch(it->path());
             }
-        } catch (...)
-        {
         }
 #else
         (void)rootPath;
@@ -170,7 +168,8 @@ private:
             if (hasPendingChange)
             {
                 const auto now = std::chrono::steady_clock::now();
-                if (const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastEventTime); elapsed >= debounceDuration)
+                if (const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastEventTime);
+                    elapsed >= debounceDuration)
                 {
                     hasPendingChange = false;
                     if (m_onChange) m_onChange();
@@ -191,7 +190,7 @@ private:
 
             if (pfd[1].revents & POLLIN)
             {
-                break; // Stop event triggered
+                break; // Stop event signalled
             }
 
             if (ret == 0 && hasPendingChange)
