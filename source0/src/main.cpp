@@ -282,9 +282,7 @@ public:
         const bool keyInteracting   = keyboard.GetKey(Key::SPACE).bPressed || keyboard.GetKey(Key::SPACE).bHeld;
         const bool isScanning       = m_shared.isScanning.load(std::memory_order_relaxed);
 
-        const bool isDirty = isScanning || hasNewTree || mouseMoved || mouseInteracting || keyInteracting;
-
-        if (isDirty)
+        if (isScanning || hasNewTree || mouseMoved || mouseInteracting || keyInteracting)
         {
             m_cleanFrames = 0;
         }
@@ -324,8 +322,7 @@ public:
         // 4. Frame rate limiter (~60 FPS fallback)
         const auto     now             = std::chrono::steady_clock::now();
         const auto     elapsed         = std::chrono::duration_cast<std::chrono::microseconds>(now - m_lastFrameTime);
-        constexpr auto targetFrameTime = std::chrono::microseconds(16666);
-        if (elapsed < targetFrameTime)
+        if (constexpr auto targetFrameTime = std::chrono::microseconds(16666); elapsed < targetFrameTime)
         {
             std::this_thread::sleep_for(targetFrameTime - elapsed);
         }
@@ -688,16 +685,13 @@ private:
     {
         if (m_shared.abortScanRequested.load(std::memory_order_relaxed)) return;
 
-        const std::vector<FileNode*> eligibleChildren = LayoutDirectChildren(node);
-
-        for (FileNode* child: eligibleChildren)
+        for (const std::vector<FileNode*> eligibleChildren = LayoutDirectChildren(node); FileNode* child: eligibleChildren)
         {
             if (m_shared.abortScanRequested.load(std::memory_order_relaxed)) return;
 
             // Fork if child has enough work and active tasks do not saturate queue
-            const bool shouldFork = allowFork && (child->children.size() >= 4) && (m_layoutActiveTaskCount.load(std::memory_order_relaxed) < static_cast<int64_t>(maxParallelTasks));
 
-            if (shouldFork && m_layoutThreadPool)
+            if (const bool shouldFork = allowFork && (child->children.size() >= 4) && (m_layoutActiveTaskCount.load(std::memory_order_relaxed) < static_cast<int64_t>(maxParallelTasks)); shouldFork && m_layoutThreadPool)
             {
                 m_layoutActiveTaskCount.fetch_add(1, std::memory_order_release);
                 m_layoutThreadPool->Enqueue([this, child, maxParallelTasks]() {
