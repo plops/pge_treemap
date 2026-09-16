@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.17)
 project(pge_treemap)
-set(CMAKE_CXX_STANDARD 20) // Same as PGE3
+set(CMAKE_CXX_STANDARD 20) # Same as PGE3
 set(CMAKE_CXX_STANDARD_REQUIRED yes)
 set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
 
