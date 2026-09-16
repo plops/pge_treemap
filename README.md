@@ -1,9 +1,12 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/plops/pge_treemap)
+
 # PGE Treemap
 
 A fast, interactive disk space visualizer built in modern C++23 and powered by **[olcPixelGameEngine3 (PGE3)](https://github.com/OneLoneCoder/olcPixelGameEngine3)**.
 
 `pge_treemap` recursively scans your filesystem in a background worker thread and builds a live hierarchical Cushion Treemap (similar to *WinDirStat*, *KDirStat*, and *SequoiaView*) to help you spot disk space hogs instantly.
 
+![Screenshot of treemap showing sizes of files in a folder](source0/img/pge_treemap_screenshot.png)
 ---
 
 ## Features
