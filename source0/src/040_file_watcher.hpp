@@ -52,7 +52,7 @@ public:
 #if defined(HAS_INOTIFY)
         if (m_stopEventFd >= 0)
         {
-            constexpr uint64_t        val = 1;
+            constexpr uint64_t    val = 1;
             [[maybe_unused]] auto s   = write(m_stopEventFd, &val, sizeof(val));
         }
 
@@ -169,7 +169,7 @@ private:
             int timeoutMs = -1;
             if (hasPendingChange)
             {
-                const auto now     = std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
                 if (const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastEventTime); elapsed >= debounceDuration)
                 {
                     hasPendingChange = false;
