@@ -2,7 +2,10 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -16,12 +19,8 @@
 
 // ----------------------------------------------------------------------------
 // Linux / X11 Idle Fix:
-// PGE3's Host_Linux_X11::StartSystem() runs:
-//     while (XPending(olc_Display)) XNextEvent(olc_Display, &xev);
-// When no events exist, XPending returns 0 without blocking, spinning the
-// main thread at 100% CPU.
-// By defining XPending with C linkage here (resolved dynamically over libX11),
-// we sleep 2ms when the event queue is empty, dropping CPU usage to ~0%.
+// PGE3's Host_Linux_X11::StartSystem() spins XPending() at 100% CPU when idle.
+// Intercepting XPending to sleep briefly when empty drops idle CPU to ~0%.
 // ----------------------------------------------------------------------------
 #if defined(__linux__)
 extern "C" {
@@ -57,11 +56,16 @@ struct FileNode {
     Pixel color      = Colour::WHITE;
 };
 
+// ----------------------------------------------------------------------------
+// Synchronization State: Background Scanner -> Main Render Thread
+// ----------------------------------------------------------------------------
 struct SharedScanContext {
-    mutable std::mutex        treeMutex;
+    // Protects readyRenderTree and currentPathInspected during handoff
+    mutable std::mutex        readySnapshotMutex;
     std::unique_ptr<FileNode> readyRenderTree = nullptr;
     std::string               currentPathInspected;
 
+    // Scan progress and lifecycle atomics
     std::atomic<bool>      isScanning{false};
     std::atomic<bool>      abortScanRequested{false};
     std::atomic<uintmax_t> totalFilesScanned{0};
@@ -79,6 +83,86 @@ struct LayoutRect {
     float y = 0.0f;
     float w = 0.0f;
     float h = 0.0f;
+};
+
+// ----------------------------------------------------------------------------
+// General-purpose ThreadPool for parallel layout computation
+// ----------------------------------------------------------------------------
+class LayoutThreadPool
+{
+public:
+    explicit LayoutThreadPool(const size_t numThreads = std::max(1u, std::thread::hardware_concurrency()))
+    {
+        m_workers.reserve(numThreads);
+        for (size_t i = 0; i < numThreads; ++i)
+        {
+            m_workers.emplace_back([this]() { WorkerLoop(); });
+        }
+    }
+
+    ~LayoutThreadPool()
+    {
+        Stop();
+    }
+
+    void Stop()
+    {
+        {
+            std::lock_guard lock(m_taskQueueMutex);
+            if (m_stopRequested) return;
+            m_stopRequested = true;
+        }
+        m_taskQueueCv.notify_all();
+        for (auto& worker: m_workers)
+        {
+            if (worker.joinable()) worker.join();
+        }
+        m_workers.clear();
+    }
+
+    template <typename F>
+    void Enqueue(F&& f)
+    {
+        {
+            std::lock_guard lock(m_taskQueueMutex);
+            m_taskQueue.emplace_back(std::forward<F>(f));
+        }
+        m_taskQueueCv.notify_one();
+    }
+
+    [[nodiscard]] size_t ThreadCount() const { return m_workers.size(); }
+
+private:
+    void WorkerLoop()
+    {
+        while (true)
+        {
+            std::function<void()> task;
+            {
+                std::unique_lock lock(m_taskQueueMutex);
+                m_taskQueueCv.wait(lock, [this]() {
+                    return m_stopRequested || !m_taskQueue.empty();
+                });
+
+                if (m_stopRequested && m_taskQueue.empty())
+                {
+                    return;
+                }
+
+                task = std::move(m_taskQueue.front());
+                m_taskQueue.pop_front();
+            }
+            task();
+        }
+    }
+
+    std::vector<std::thread>          m_workers;
+    std::deque<std::function<void()>> m_taskQueue;
+
+    // Synchronization protecting m_taskQueue and m_stopRequested
+    std::mutex              m_taskQueueMutex;
+    std::condition_variable m_taskQueueCv;
+    bool                    m_stopRequested = false;
 };
 
 Pixel HSLtoPixel(float h, float s, float l)
@@ -123,15 +207,25 @@ public:
     {
         m_shared.abortScanRequested = true;
         if (m_scanThread.joinable()) m_scanThread.join();
+        if (m_layoutThreadPool) m_layoutThreadPool->Stop();
     }
 
 private:
     const vi2d m_screenSize      = {1920, 1080};
     const vf2d WORLD_CANVAS_SIZE = {1920.0f, 1080.0f};
 
-    SharedScanContext         m_shared;
-    std::thread               m_scanThread;
-    std::unique_ptr<FileNode> m_renderRoot = nullptr;
+    SharedScanContext            m_shared;
+    std::thread                  m_scanThread;
+    std::unique_ptr<FileNode>    m_renderRoot = nullptr;
+    std::unique_ptr<LayoutThreadPool> m_layoutThreadPool = nullptr;
+
+    // ------------------------------------------------------------------------
+    // Synchronization for parallel layout execution:
+    // Tracks in-flight layout tasks and wakes the publisher once root finishes.
+    // ------------------------------------------------------------------------
+    std::atomic<int64_t>    m_layoutActiveTaskCount{0};
+    std::mutex              m_layoutCompletionMutex;
+    std::condition_variable m_layoutCompletionCv;
 
     vf2d            m_cameraOffset = {0.0f, 0.0f};
     float           m_cameraZoom   = 1.0f;
@@ -147,8 +241,9 @@ private:
 public:
     bool OnUserCreate() override
     {
-        m_lastMousePos  = mouse.GetPosition();
-        m_lastFrameTime = std::chrono::steady_clock::now();
+        m_layoutThreadPool = std::make_unique<LayoutThreadPool>();
+        m_lastMousePos     = mouse.GetPosition();
+        m_lastFrameTime    = std::chrono::steady_clock::now();
         StartBackgroundScan(fs::current_path());
         return true;
     }
@@ -163,11 +258,11 @@ public:
 
         // 1. Instant non-blocking tree swap
         bool hasNewTree = false;
-        if (m_shared.hasNewDataForRender.load(std::memory_order_relaxed))
+        if (m_shared.hasNewDataForRender.load(std::memory_order_acquire))
         {
             std::unique_ptr<FileNode> newTree = nullptr;
             {
-                std::lock_guard lock(m_shared.treeMutex);
+                std::lock_guard lock(m_shared.readySnapshotMutex);
                 newTree = std::move(m_shared.readyRenderTree);
                 m_shared.hasNewDataForRender.store(false, std::memory_order_relaxed);
             }
@@ -183,7 +278,10 @@ public:
         // 2. Activity / Dirty detection
         const vi2d currentMousePos  = mouse.GetPosition();
         const bool mouseMoved       = (currentMousePos != m_lastMousePos);
-        const bool mouseInteracting = mouse.GetButton(0).bHeld || mouse.GetButton(0).bPressed || mouse.GetButton(0).bReleased || mouse.GetButton(1).bHeld || mouse.GetButton(1).bPressed || mouse.GetButton(1).bReleased || mouse.GetButton(2).bHeld || mouse.GetButton(2).bPressed || mouse.GetButton(2).bReleased || mouse.GetWheel() != 0;
+        const bool mouseInteracting = mouse.GetButton(0).bHeld || mouse.GetButton(0).bPressed || mouse.GetButton(0).bReleased ||
+                                      mouse.GetButton(1).bHeld || mouse.GetButton(1).bPressed || mouse.GetButton(1).bReleased ||
+                                      mouse.GetButton(2).bHeld || mouse.GetButton(2).bPressed || mouse.GetButton(2).bReleased ||
+                                      mouse.GetWheel() != 0;
         const bool keyInteracting   = keyboard.GetKey(Key::SPACE).bPressed || keyboard.GetKey(Key::SPACE).bHeld;
         const bool isScanning       = m_shared.isScanning.load(std::memory_order_relaxed);
 
@@ -226,7 +324,7 @@ public:
         draw.WorldReset();
         RenderHUD();
 
-        // 4. Fallback frame rate limiter (~60 FPS) in case OpenGL driver ignores VSync
+        // 4. Frame rate limiter (~60 FPS fallback)
         const auto     now             = std::chrono::steady_clock::now();
         const auto     elapsed         = std::chrono::duration_cast<std::chrono::microseconds>(now - m_lastFrameTime);
         constexpr auto targetFrameTime = std::chrono::microseconds(16666);
@@ -273,7 +371,6 @@ private:
             {
                 if (m_shared.abortScanRequested) return;
 
-                // Avoid infinite recursive loops on directory symlinks
                 std::error_code ec;
                 if (entry.is_symlink(ec)) continue;
 
@@ -320,20 +417,23 @@ private:
 
     void PublishSnapshot(const std::string& currentInspectedPath)
     {
-        if (!m_workerRoot) return;
+        if (!m_workerRoot || m_shared.abortScanRequested) return;
 
         auto snapshot = DeepCopyTree(m_workerRoot.get());
-        if (!snapshot || snapshot->sizeBytes == 0) return;
+        if (!snapshot || snapshot->sizeBytes == 0 || m_shared.abortScanRequested) return;
 
         snapshot->visualPos  = {0.0f, 0.0f};
         snapshot->visualSize = WORLD_CANVAS_SIZE;
-        CalculateTreemapLayout(snapshot.get(), snapshot->visualPos, snapshot->visualSize);
+
+        CalculateTreemapLayoutParallel(snapshot.get(), snapshot->visualPos, snapshot->visualSize);
+
+        if (m_shared.abortScanRequested) return;
 
         {
-            std::lock_guard lock(m_shared.treeMutex);
+            std::lock_guard lock(m_shared.readySnapshotMutex);
             m_shared.readyRenderTree      = std::move(snapshot);
             m_shared.currentPathInspected = currentInspectedPath;
-            m_shared.hasNewDataForRender.store(true, std::memory_order_relaxed);
+            m_shared.hasNewDataForRender.store(true, std::memory_order_release);
         }
     }
 
@@ -397,11 +497,6 @@ private:
                 child->visualPos  = {rect.x, currentY};
                 child->visualSize = {rowThickness, itemHeight};
                 currentY += itemHeight;
-
-                if (child->visualSize.x >= 0.5f && child->visualSize.y >= 0.5f && !child->children.empty())
-                {
-                    CalculateTreemapLayout(child, child->visualPos, child->visualSize);
-                }
             }
 
             rect.x += rowThickness;
@@ -410,7 +505,9 @@ private:
         }
         else
         {
-            float rowThickness = isLastRow ? rect.h : static_cast<float>(rowAreaSum / rect.h);
+            // Bug Fix: When rect.h > rect.w, row spans width rect.w and has height rowThickness.
+            // Area = rect.w * rowThickness -> rowThickness = rowAreaSum / rect.w.
+            float rowThickness = isLastRow ? rect.h : static_cast<float>(rowAreaSum / rect.w);
             rowThickness       = std::clamp(rowThickness, 0.0f, rect.h);
 
             float currentX = rect.x;
@@ -431,11 +528,6 @@ private:
                 child->visualPos  = {currentX, rect.y};
                 child->visualSize = {itemWidth, rowThickness};
                 currentX += itemWidth;
-
-                if (child->visualSize.x >= 0.5f && child->visualSize.y >= 0.5f && !child->children.empty())
-                {
-                    CalculateTreemapLayout(child, child->visualPos, child->visualSize);
-                }
             }
 
             rect.y += rowThickness;
@@ -444,13 +536,15 @@ private:
         }
     }
 
-    static void CalculateTreemapLayout(FileNode* node, const vf2d pos, const vf2d size)
+    // ------------------------------------------------------------------------
+    // Squarifies a single directory node's immediate children, returning all
+    // non-leaf subdirectories that require recursive layout.
+    // ------------------------------------------------------------------------
+    static std::vector<FileNode*> LayoutDirectChildren(FileNode* node)
     {
-        if (!node || node->sizeBytes == 0) return;
-        node->visualPos  = pos;
-        node->visualSize = size;
-
-        if (size.x < 0.5f || size.y < 0.5f || node->children.empty()) return;
+        std::vector<FileNode*> eligibleChildren;
+        if (!node || node->sizeBytes == 0 || node->children.empty()) return eligibleChildren;
+        if (node->visualSize.x < 0.5f || node->visualSize.y < 0.5f) return eligibleChildren;
 
         std::ranges::sort(node->children,
                           [](const auto& a, const auto& b) { return a->sizeBytes > b->sizeBytes; });
@@ -463,9 +557,9 @@ private:
                 totalBytes += child->sizeBytes;
             }
         }
-        if (totalBytes == 0) return;
+        if (totalBytes == 0) return eligibleChildren;
 
-        const double              totalArea = static_cast<double>(size.x) * static_cast<double>(size.y);
+        const double totalArea = static_cast<double>(node->visualSize.x) * static_cast<double>(node->visualSize.y);
         std::vector<SquarifyItem> items;
         items.reserve(node->children.size());
 
@@ -478,14 +572,14 @@ private:
             }
             else if (child)
             {
-                child->visualPos  = pos;
+                child->visualPos  = node->visualPos;
                 child->visualSize = {0.0f, 0.0f};
             }
         }
 
-        if (items.empty()) return;
+        if (items.empty()) return eligibleChildren;
 
-        LayoutRect                rect = {.x = pos.x, .y = pos.y, .w = size.x, .h = size.y};
+        LayoutRect rect = {.x = node->visualPos.x, .y = node->visualPos.y, .w = node->visualSize.x, .h = node->visualSize.y};
         std::vector<SquarifyItem> currentRow;
         double                    currentRowAreaSum = 0.0;
 
@@ -535,6 +629,91 @@ private:
         if (!currentRow.empty())
         {
             LayoutRow(currentRow, currentRowAreaSum, rect, true);
+        }
+
+        eligibleChildren.reserve(node->children.size());
+        for (const auto& child: node->children)
+        {
+            if (child && !child->children.empty() && child->visualSize.x >= 0.5f && child->visualSize.y >= 0.5f)
+            {
+                eligibleChildren.push_back(child.get());
+            }
+        }
+        return eligibleChildren;
+    }
+
+    // ------------------------------------------------------------------------
+    // Parallel Treemap Layout Driver
+    // ------------------------------------------------------------------------
+    void CalculateTreemapLayoutParallel(FileNode* root, const vf2d pos, const vf2d size)
+    {
+        if (!root || root->sizeBytes == 0) return;
+        root->visualPos  = pos;
+        root->visualSize = size;
+        if (size.x < 0.5f || size.y < 0.5f || root->children.empty()) return;
+
+        const size_t maxParallelTasks = m_layoutThreadPool ? m_layoutThreadPool->ThreadCount() * 4 : 1;
+
+        // Initialize active tasks count with the root task
+        m_layoutActiveTaskCount.store(1, std::memory_order_release);
+
+        if (m_layoutThreadPool && m_layoutThreadPool->ThreadCount() > 1)
+        {
+            m_layoutThreadPool->Enqueue([this, root, maxParallelTasks]() {
+                ExecuteSubtreeTask(root, maxParallelTasks);
+            });
+
+            // Wait until m_layoutActiveTaskCount reaches zero (all tasks in the tree complete)
+            std::unique_lock lock(m_layoutCompletionMutex);
+            m_layoutCompletionCv.wait(lock, [this]() {
+                return m_layoutActiveTaskCount.load(std::memory_order_acquire) == 0;
+            });
+        }
+        else
+        {
+            ExecuteSubtreeTask(root, 0);
+        }
+    }
+
+    void ExecuteSubtreeTask(FileNode* node, const size_t maxParallelTasks)
+    {
+        LayoutSubtreeRecursive(node, true, maxParallelTasks);
+
+        // Notify when all tasks have finished across the pool
+        if (m_layoutActiveTaskCount.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        {
+            std::lock_guard lock(m_layoutCompletionMutex);
+            m_layoutCompletionCv.notify_all();
+        }
+    }
+
+    void LayoutSubtreeRecursive(FileNode* node, const bool allowFork, const size_t maxParallelTasks)
+    {
+        if (m_shared.abortScanRequested.load(std::memory_order_relaxed)) return;
+
+        const std::vector<FileNode*> eligibleChildren = LayoutDirectChildren(node);
+
+        for (FileNode* child: eligibleChildren)
+        {
+            if (m_shared.abortScanRequested.load(std::memory_order_relaxed)) return;
+
+            // Fork if child has enough work and active tasks do not saturate queue
+            const bool shouldFork = allowFork &&
+                                    (child->children.size() >= 4) &&
+                                    (m_layoutActiveTaskCount.load(std::memory_order_relaxed) < static_cast<int64_t>(maxParallelTasks));
+
+            if (shouldFork && m_layoutThreadPool)
+            {
+                m_layoutActiveTaskCount.fetch_add(1, std::memory_order_release);
+                m_layoutThreadPool->Enqueue([this, child, maxParallelTasks]() {
+                    ExecuteSubtreeTask(child, maxParallelTasks);
+                });
+            }
+            else
+            {
+                // Process sequentially on the current worker thread
+                LayoutSubtreeRecursive(child, false, maxParallelTasks);
+            }
         }
     }
 
@@ -698,7 +877,7 @@ private:
         {
             std::string inspecting;
             {
-                std::lock_guard lock(m_shared.treeMutex);
+                std::lock_guard lock(m_shared.readySnapshotMutex);
                 inspecting = m_shared.currentPathInspected;
             }
             draw.String({10.0f, 26.0f}, "Scanning: " + inspecting, Colour::GREY);
@@ -730,7 +909,6 @@ int main()
 {
     const PGEConfig config = [] {
         PGEConfig c{
-            // .WindowConfig = { .bFullScreen = false }, // This should be possible in C++26, eventually
             .vScreenSize = {1920, 1080},
             .vPixelSize  = {1, 1},
             .bVSync      = true};
