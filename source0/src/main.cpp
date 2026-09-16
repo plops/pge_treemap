@@ -6,13 +6,23 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
+
+#if defined(__linux__) && __has_include(<sys/inotify.h>)
+#define HAS_INOTIFY 1
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/inotify.h>
+#include <unistd.h>
+#endif
 
 #define OLC_PGE3_APPLICATION
 #include "olcPixelGameEngine3.h"
@@ -60,12 +70,10 @@ struct FileNode {
 // Synchronization State: Background Scanner -> Main Render Thread
 // ----------------------------------------------------------------------------
 struct SharedScanContext {
-    // Protects readyRenderTree and currentPathInspected during handoff
     mutable std::mutex        readySnapshotMutex;
     std::unique_ptr<FileNode> readyRenderTree = nullptr;
     std::string               currentPathInspected;
 
-    // Scan progress and lifecycle atomics
     std::atomic<bool>      isScanning{false};
     std::atomic<bool>      abortScanRequested{false};
     std::atomic<uintmax_t> totalFilesScanned{0};
@@ -159,7 +167,6 @@ private:
     std::vector<std::thread>          m_workers;
     std::deque<std::function<void()>> m_taskQueue;
 
-    // Synchronization protecting m_taskQueue and m_stopRequested
     std::mutex              m_taskQueueMutex;
     std::condition_variable m_taskQueueCv;
     bool                    m_stopRequested = false;
@@ -201,11 +208,33 @@ Pixel GetColorForFilename(const std::string_view name)
 class DiskTreemapAnalyzer : public PixelGameEngine
 {
 public:
-    DiskTreemapAnalyzer() { sAppName = "PGE3 - Live Disk Treemap Visualizer"; }
+    explicit DiskTreemapAnalyzer(fs::path targetPath)
+        : m_targetPath(std::move(targetPath))
+    {
+        sAppName = "PGE3 - Treemap [" + m_targetPath.string() + "]";
+    }
 
     ~DiskTreemapAnalyzer() override
     {
         m_shared.abortScanRequested = true;
+
+        {
+            std::lock_guard lock(m_scanMutex);
+            m_scanRequested = false;
+        }
+        m_scanCv.notify_all();
+
+#if defined(HAS_INOTIFY)
+        if (m_stopEventFd >= 0)
+        {
+            uint64_t              val          = 1;
+            [[maybe_unused]] auto bytesWritten = write(m_stopEventFd, &val, sizeof(val));
+        }
+        if (m_inotifyThread.joinable()) m_inotifyThread.join();
+        if (m_inotifyFd >= 0) close(m_inotifyFd);
+        if (m_stopEventFd >= 0) close(m_stopEventFd);
+#endif
+
         if (m_scanThread.joinable()) m_scanThread.join();
         if (m_layoutThreadPool) m_layoutThreadPool->Stop();
     }
@@ -214,15 +243,16 @@ private:
     const vi2d m_screenSize      = {1920, 1080};
     const vf2d WORLD_CANVAS_SIZE = {1920.0f, 1080.0f};
 
-    SharedScanContext                 m_shared;
-    std::thread                       m_scanThread;
+    fs::path                m_targetPath;
+    SharedScanContext       m_shared;
+    std::thread             m_scanThread;
+    std::mutex              m_scanMutex;
+    std::condition_variable m_scanCv;
+    bool                    m_scanRequested = true;
+
     std::unique_ptr<FileNode>         m_renderRoot       = nullptr;
     std::unique_ptr<LayoutThreadPool> m_layoutThreadPool = nullptr;
 
-    // ------------------------------------------------------------------------
-    // Synchronization for parallel layout execution:
-    // Tracks in-flight layout tasks and wakes the publisher once root finishes.
-    // ------------------------------------------------------------------------
     std::atomic<int64_t>    m_layoutActiveTaskCount{0};
     std::mutex              m_layoutCompletionMutex;
     std::condition_variable m_layoutCompletionCv;
@@ -238,24 +268,42 @@ private:
     uint32_t                              m_filesSinceLastPublishCheck = 0;
     std::unique_ptr<FileNode>             m_workerRoot                 = nullptr;
 
+#if defined(HAS_INOTIFY)
+    int                                  m_inotifyFd   = -1;
+    int                                  m_stopEventFd = -1;
+    std::thread                          m_inotifyThread;
+    std::mutex                           m_watchMutex;
+    std::unordered_map<int, fs::path>    m_wdToPath;
+    std::unordered_map<std::string, int> m_pathToWd;
+    bool                                 m_inotifyActive = false;
+#endif
+
 public:
     bool OnUserCreate() override
     {
         m_layoutThreadPool = std::make_unique<LayoutThreadPool>();
         m_lastMousePos     = mouse.GetPosition();
         m_lastFrameTime    = std::chrono::steady_clock::now();
-        StartBackgroundScan(fs::current_path());
+
+#if defined(HAS_INOTIFY)
+        m_inotifyFd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (m_inotifyFd >= 0)
+        {
+            m_stopEventFd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+            if (m_stopEventFd >= 0)
+            {
+                m_inotifyActive = true;
+                m_inotifyThread = std::thread([this]() { InotifyLoop(); });
+            }
+        }
+#endif
+
+        m_scanThread = std::thread([this]() { ScanWorkerLoop(); });
         return true;
     }
 
     bool OnUserUpdate(float fElapsedTime) override
     {
-        // Reclaim worker thread once scanning is done
-        if (!m_shared.isScanning.load(std::memory_order_relaxed) && m_scanThread.joinable())
-        {
-            m_scanThread.join();
-        }
-
         // 1. Instant non-blocking tree swap
         bool hasNewTree = false;
         if (m_shared.hasNewDataForRender.load(std::memory_order_acquire))
@@ -332,28 +380,55 @@ public:
     }
 
 private:
-    void StartBackgroundScan(const fs::path& targetDirectory)
+    void RequestRescan()
     {
-        if (m_shared.isScanning) return;
-        m_shared.isScanning         = true;
-        m_shared.abortScanRequested = false;
+        {
+            std::lock_guard lock(m_scanMutex);
+            m_scanRequested = true;
+        }
+        m_scanCv.notify_one();
+    }
 
-        m_scanThread = std::thread([this, targetDirectory]() {
-            m_workerRoot              = std::make_unique<FileNode>();
-            m_workerRoot->name        = targetDirectory.filename().string();
+    void ScanWorkerLoop()
+    {
+        while (!m_shared.abortScanRequested)
+        {
+            {
+                std::unique_lock lock(m_scanMutex);
+                m_scanCv.wait(lock, [this]() {
+                    return m_shared.abortScanRequested || m_scanRequested;
+                });
+
+                if (m_shared.abortScanRequested) break;
+                m_scanRequested = false;
+            }
+
+            m_shared.isScanning        = true;
+            m_shared.totalBytesScanned = 0;
+            m_shared.totalFilesScanned = 0;
+
+            m_workerRoot         = std::make_unique<FileNode>();
+            std::string rootName = m_targetPath.filename().string();
+            if (rootName.empty())
+            {
+                rootName = m_targetPath.lexically_normal().filename().string();
+                if (rootName.empty()) rootName = m_targetPath.string();
+            }
+            m_workerRoot->name        = rootName;
             m_workerRoot->isDirectory = true;
 
             m_lastPublishTime            = std::chrono::steady_clock::now();
             m_filesSinceLastPublishCheck = 0;
 
-            ScanDirectoryRecursive(targetDirectory, m_workerRoot.get());
+            AddSingleWatch(m_targetPath);
+            ScanDirectoryRecursive(m_targetPath, m_workerRoot.get());
 
             if (!m_shared.abortScanRequested)
             {
-                PublishSnapshot(targetDirectory.string());
+                PublishSnapshot(m_targetPath.string());
             }
             m_shared.isScanning = false;
-        });
+        }
     }
 
     void ScanDirectoryRecursive(const fs::path& currentPath, FileNode* parentNode)
@@ -377,6 +452,7 @@ private:
 
                 if (childPtr->isDirectory)
                 {
+                    AddSingleWatch(entry.path());
                     ScanDirectoryRecursive(entry.path(), childPtr);
                 }
                 else
@@ -430,6 +506,176 @@ private:
             m_shared.hasNewDataForRender.store(true, std::memory_order_release);
         }
     }
+
+    // ------------------------------------------------------------------------
+    // Linux inotify File System Watcher
+    // ------------------------------------------------------------------------
+    void AddSingleWatch(const fs::path& p)
+    {
+#if defined(HAS_INOTIFY)
+        if (m_inotifyFd < 0) return;
+
+        std::error_code ec;
+        fs::path        canon   = fs::weakly_canonical(p, ec);
+        std::string     pathStr = (!ec) ? canon.string() : p.lexically_normal().string();
+
+        std::lock_guard lock(m_watchMutex);
+        if (m_pathToWd.contains(pathStr)) return;
+
+        constexpr uint32_t flags = IN_MODIFY | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_ATTRIB;
+        const int          wd    = inotify_add_watch(m_inotifyFd, pathStr.c_str(), flags);
+        if (wd >= 0)
+        {
+            m_wdToPath[wd]      = pathStr;
+            m_pathToWd[pathStr] = wd;
+        }
+#else
+        (void)p;
+#endif
+    }
+
+    void AddWatchRecursive(const fs::path& rootPath)
+    {
+#if defined(HAS_INOTIFY)
+        if (m_inotifyFd < 0) return;
+        std::error_code ec;
+        if (!fs::exists(rootPath, ec) || !fs::is_directory(rootPath, ec)) return;
+
+        AddSingleWatch(rootPath);
+        try
+        {
+            for (const auto& entry:
+                 fs::recursive_directory_iterator(rootPath, fs::directory_options::skip_permission_denied, ec))
+            {
+                if (m_shared.abortScanRequested) return;
+                if (entry.is_directory(ec))
+                {
+                    AddSingleWatch(entry.path());
+                }
+            }
+        } catch (...)
+        {
+        }
+#else
+        (void)rootPath;
+#endif
+    }
+
+#if defined(HAS_INOTIFY)
+    void RemoveWatch(const int wd)
+    {
+        std::lock_guard lock(m_watchMutex);
+        if (const auto it = m_wdToPath.find(wd); it != m_wdToPath.end())
+        {
+            m_pathToWd.erase(it->second.string());
+            m_wdToPath.erase(it);
+        }
+    }
+
+    fs::path GetPathForWd(const int wd)
+    {
+        std::lock_guard lock(m_watchMutex);
+        if (const auto it = m_wdToPath.find(wd); it != m_wdToPath.end())
+        {
+            return it->second;
+        }
+        return {};
+    }
+
+    void InotifyLoop()
+    {
+        bool           hasPendingChange = false;
+        auto           lastEventTime    = std::chrono::steady_clock::now();
+        constexpr auto debounceDuration = std::chrono::milliseconds(300);
+
+        pollfd pfd[2];
+        pfd[0].fd     = m_inotifyFd;
+        pfd[0].events = POLLIN;
+        pfd[1].fd     = m_stopEventFd;
+        pfd[1].events = POLLIN;
+
+        alignas(alignof(struct inotify_event)) char buffer[4096 * 8];
+
+        while (!m_shared.abortScanRequested)
+        {
+            int timeoutMs = -1;
+            if (hasPendingChange)
+            {
+                const auto now     = std::chrono::steady_clock::now();
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastEventTime);
+                if (elapsed >= debounceDuration)
+                {
+                    hasPendingChange = false;
+                    RequestRescan();
+                    timeoutMs = -1;
+                }
+                else
+                {
+                    timeoutMs = static_cast<int>((debounceDuration - elapsed).count());
+                }
+            }
+
+            const int ret = poll(pfd, 2, timeoutMs);
+            if (ret < 0)
+            {
+                if (errno == EINTR) continue;
+                break;
+            }
+
+            if (pfd[1].revents & POLLIN)
+            {
+                break;
+            }
+
+            if (ret == 0 && hasPendingChange)
+            {
+                hasPendingChange = false;
+                RequestRescan();
+                continue;
+            }
+
+            if (pfd[0].revents & POLLIN)
+            {
+                const ssize_t len = read(m_inotifyFd, buffer, sizeof(buffer));
+                if (len > 0)
+                {
+                    for (char* ptr = buffer; ptr < buffer + len;)
+                    {
+                        const auto* event = reinterpret_cast<const struct inotify_event*>(ptr);
+
+                        if (event->mask & IN_IGNORED)
+                        {
+                            RemoveWatch(event->wd);
+                        }
+                        else if (event->mask & IN_Q_OVERFLOW)
+                        {
+                            hasPendingChange = true;
+                            lastEventTime    = std::chrono::steady_clock::now();
+                        }
+                        else
+                        {
+                            if ((event->mask & IN_ISDIR) && (event->mask & (IN_CREATE | IN_MOVED_TO)))
+                            {
+                                if (event->len > 0)
+                                {
+                                    const fs::path parentPath = GetPathForWd(event->wd);
+                                    if (!parentPath.empty())
+                                    {
+                                        AddWatchRecursive(parentPath / event->name);
+                                    }
+                                }
+                            }
+                            hasPendingChange = true;
+                            lastEventTime    = std::chrono::steady_clock::now();
+                        }
+
+                        ptr += sizeof(struct inotify_event) + event->len;
+                    }
+                }
+            }
+        }
+    }
+#endif
 
     static double WorstAspectRatio(const std::vector<SquarifyItem>& row, const double rowAreaSum, const double s)
     {
@@ -499,8 +745,6 @@ private:
         }
         else
         {
-            // Bug Fix: When rect.h > rect.w, row spans width rect.w and has height rowThickness.
-            // Area = rect.w * rowThickness -> rowThickness = rowAreaSum / rect.w.
             float rowThickness = isLastRow ? rect.h : static_cast<float>(rowAreaSum / rect.w);
             rowThickness       = std::clamp(rowThickness, 0.0f, rect.h);
 
@@ -530,10 +774,6 @@ private:
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Squarifies a single directory node's immediate children, returning all
-    // non-leaf subdirectories that require recursive layout.
-    // ------------------------------------------------------------------------
     static std::vector<FileNode*> LayoutDirectChildren(FileNode* node)
     {
         std::vector<FileNode*> eligibleChildren;
@@ -636,9 +876,6 @@ private:
         return eligibleChildren;
     }
 
-    // ------------------------------------------------------------------------
-    // Parallel Treemap Layout Driver
-    // ------------------------------------------------------------------------
     void CalculateTreemapLayoutParallel(FileNode* root, const vf2d pos, const vf2d size)
     {
         if (!root || root->sizeBytes == 0) return;
@@ -647,8 +884,6 @@ private:
         if (size.x < 0.5f || size.y < 0.5f || root->children.empty()) return;
 
         const size_t maxParallelTasks = m_layoutThreadPool ? m_layoutThreadPool->ThreadCount() * 4 : 1;
-
-        // Initialize active tasks count with the root task
         m_layoutActiveTaskCount.store(1, std::memory_order_release);
 
         if (m_layoutThreadPool && m_layoutThreadPool->ThreadCount() > 1)
@@ -657,7 +892,6 @@ private:
                 ExecuteSubtreeTask(root, maxParallelTasks);
             });
 
-            // Wait until m_layoutActiveTaskCount reaches zero (all tasks in the tree complete)
             std::unique_lock lock(m_layoutCompletionMutex);
             m_layoutCompletionCv.wait(lock, [this]() {
                 return m_layoutActiveTaskCount.load(std::memory_order_acquire) == 0;
@@ -673,7 +907,6 @@ private:
     {
         LayoutSubtreeRecursive(node, true, maxParallelTasks);
 
-        // Notify when all tasks have finished across the pool
         if (m_layoutActiveTaskCount.fetch_sub(1, std::memory_order_acq_rel) == 1)
         {
             std::lock_guard lock(m_layoutCompletionMutex);
@@ -689,8 +922,6 @@ private:
         {
             if (m_shared.abortScanRequested.load(std::memory_order_relaxed)) return;
 
-            // Fork if child has enough work and active tasks do not saturate queue
-
             if (const bool shouldFork = allowFork && (child->children.size() >= 4) && (m_layoutActiveTaskCount.load(std::memory_order_relaxed) < static_cast<int64_t>(maxParallelTasks)); shouldFork && m_layoutThreadPool)
             {
                 m_layoutActiveTaskCount.fetch_add(1, std::memory_order_release);
@@ -700,7 +931,6 @@ private:
             }
             else
             {
-                // Process sequentially on the current worker thread
                 LayoutSubtreeRecursive(child, false, maxParallelTasks);
             }
         }
@@ -770,7 +1000,7 @@ private:
         const float screenW = size.x * m_cameraZoom;
         if (const float screenH = size.y * m_cameraZoom; screenW < 4.0f || screenH < 4.0f) return;
 
-        float           bevel = std::clamp(std::min(size.x, size.y) * 0.15f, 1.0f, 8.0f);
+        const float     bevel = std::clamp(std::min(size.x, size.y) * 0.15f, 1.0f, 8.0f);
         constexpr Pixel highlight(255, 255, 255, 80);
         draw.FilledRect(pos, {size.x, bevel}, highlight);
         draw.FilledRect(pos, {bevel, size.y}, highlight);
@@ -850,12 +1080,27 @@ private:
         const vf2d     barSize = {static_cast<float>(m_screenSize.x), 45.0f};
         draw.FilledRect(barPos, barSize, Pixel(15, 18, 22, 230), Colour::WHITE);
 
-        const std::string scanStatus  = m_shared.isScanning ? "SCANNING..." : "SCAN FINISHED";
-        const Pixel       statusColor = m_shared.isScanning ? Colour::YELLOW : Colour::GREEN;
+        std::string scanStatus  = m_shared.isScanning ? "SCANNING..." : "SCAN FINISHED";
+        Pixel       statusColor = m_shared.isScanning ? Colour::YELLOW : Colour::GREEN;
+
+#if defined(HAS_INOTIFY)
+        if (m_inotifyActive && !m_shared.isScanning)
+        {
+            scanStatus  = "LIVE (INOTIFY)";
+            statusColor = Colour::GREEN;
+        }
+#endif
 
         draw.String({10.0f, 8.0f}, scanStatus, statusColor);
         draw.String({150.0f, 8.0f}, "Files: " + std::to_string(m_shared.totalFilesScanned.load()), Colour::WHITE);
         draw.String({320.0f, 8.0f}, "Size: " + FormatBytes(m_shared.totalBytesScanned.load()), Colour::CYAN);
+
+        std::string pathDisplay = m_targetPath.string();
+        if (pathDisplay.length() > 65)
+        {
+            pathDisplay = "..." + pathDisplay.substr(pathDisplay.length() - 62);
+        }
+        draw.String({500.0f, 8.0f}, "Path: " + pathDisplay, Colour::GREY);
 
         if (m_hoveredNode)
         {
@@ -894,8 +1139,52 @@ private:
 };
 } // namespace
 
-int main()
+int main(int argc, char* argv[])
 {
+    fs::path targetDir = fs::current_path();
+
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string_view arg = argv[i];
+        if (arg == "-h" || arg == "--help")
+        {
+            std::cout << "Usage: " << argv[0] << " [DIRECTORY] [OPTIONS]\n\n"
+                      << "Options:\n"
+                      << "  -d, --dir <PATH>     Directory to visualize\n"
+                      << "  -h, --help           Display this help and exit\n\n"
+                      << "If no directory is provided, the current working directory is used.\n"
+                      << "On Linux with inotify, changes inside the directory automatically update the treemap.\n";
+            return 0;
+        }
+        if ((arg == "-d" || arg == "--dir" || arg == "-p" || arg == "--path") && i + 1 < argc)
+        {
+            targetDir = argv[++i];
+        }
+        else if (!arg.starts_with('-'))
+        {
+            targetDir = arg;
+        }
+        else
+        {
+            std::cerr << "Unknown option: " << arg << "\n"
+                      << "Run '" << argv[0] << " --help' for usage.\n";
+            return 1;
+        }
+    }
+
+    std::error_code ec;
+    targetDir = fs::absolute(targetDir, ec);
+    if (ec || !fs::exists(targetDir, ec))
+    {
+        std::cerr << "Error: Path does not exist: " << targetDir.string() << "\n";
+        return 1;
+    }
+    if (!fs::is_directory(targetDir, ec))
+    {
+        std::cerr << "Error: Path is not a directory: " << targetDir.string() << "\n";
+        return 1;
+    }
+
     const PGEConfig config = [] {
         PGEConfig c{
             .vScreenSize = {1920, 1080},
@@ -904,7 +1193,8 @@ int main()
         c.bFullScreen = false;
         return c;
     }();
-    if (DiskTreemapAnalyzer demo; demo.Construct(config))
+
+    if (DiskTreemapAnalyzer demo(targetDir); demo.Construct(config))
     {
         demo.Start();
     }
