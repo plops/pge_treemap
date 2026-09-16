@@ -320,8 +320,8 @@ public:
         RenderHUD();
 
         // 4. Frame rate limiter (~60 FPS fallback)
-        const auto     now             = std::chrono::steady_clock::now();
-        const auto     elapsed         = std::chrono::duration_cast<std::chrono::microseconds>(now - m_lastFrameTime);
+        const auto now     = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - m_lastFrameTime);
         if (constexpr auto targetFrameTime = std::chrono::microseconds(16666); elapsed < targetFrameTime)
         {
             std::this_thread::sleep_for(targetFrameTime - elapsed);
