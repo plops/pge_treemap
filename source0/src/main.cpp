@@ -728,8 +728,15 @@ private:
 
 int main()
 {
-    PGEConfig config{.vScreenSize = {1920, 1080}, .vPixelSize = {1, 1}, .bVSync = True};
-    config.bFullScreen = false;
+    const PGEConfig config = [] {
+        PGEConfig c{
+            // .WindowConfig = { .bFullScreen = false }, // This should be possible in C++26, eventually
+            .vScreenSize = {1920, 1080},
+            .vPixelSize  = {1, 1},
+            .bVSync      = true};
+        c.bFullScreen = false;
+        return c;
+    }();
     if (DiskTreemapAnalyzer demo; demo.Construct(config))
     {
         demo.Start();
