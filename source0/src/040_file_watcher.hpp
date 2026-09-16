@@ -83,15 +83,14 @@ public:
 #if defined(HAS_INOTIFY)
         if (m_inotifyFd < 0) return;
 
-        std::error_code ec;
-        const fs::path  canon = fs::weakly_canonical(p, ec);
+        std::error_code   ec;
+        const fs::path    canon   = fs::weakly_canonical(p, ec);
         const std::string pathStr = (!ec) ? canon.string() : p.lexically_normal().string();
 
         std::lock_guard lock(m_watchMutex);
         if (m_pathToWd.contains(pathStr)) return;
 
-        constexpr uint32_t flags = IN_MODIFY | IN_CREATE | IN_DELETE | IN_DELETE_SELF |
-                                   IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_ATTRIB;
+        constexpr uint32_t flags = IN_MODIFY | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_ATTRIB;
         if (const int wd = inotify_add_watch(m_inotifyFd, pathStr.c_str(), flags); wd >= 0)
         {
             m_wdToPath[wd]      = pathStr;

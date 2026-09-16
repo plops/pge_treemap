@@ -163,8 +163,7 @@ private:
                     try
                     {
                         childPtr->sizeBytes = entry.file_size();
-                    }
-                    catch (...)
+                    } catch (...)
                     {
                         childPtr->sizeBytes = 0;
                     }
@@ -184,8 +183,7 @@ private:
                     }
                 }
             }
-        }
-        catch (...)
+        } catch (...)
         {
         }
     }
@@ -195,8 +193,7 @@ private:
         if (!m_workerRoot || m_shared.abortScanRequested.load(std::memory_order_relaxed) || m_stopRequested) return;
 
         auto snapshot = DeepCopyTree(m_workerRoot.get());
-        if (!snapshot || snapshot->sizeBytes == 0 ||
-            m_shared.abortScanRequested.load(std::memory_order_relaxed) || m_stopRequested) return;
+        if (!snapshot || snapshot->sizeBytes == 0 || m_shared.abortScanRequested.load(std::memory_order_relaxed) || m_stopRequested) return;
 
         snapshot->visualPos  = {0.0f, 0.0f};
         snapshot->visualSize = m_canvasSize;

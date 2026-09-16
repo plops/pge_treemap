@@ -1,5 +1,6 @@
 #define OLC_PGE3_APPLICATION
 
+#include "000_platform_fix.hpp"
 #include "070_treemap_app.hpp"
 #include "080_cli.hpp"
 
