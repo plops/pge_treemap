@@ -25,21 +25,21 @@
 // ----------------------------------------------------------------------------
 #if defined(__linux__)
 extern "C" {
-    struct _XDisplay;
-    int XEventsQueued(struct _XDisplay* display, int mode);
+struct _XDisplay;
+int XEventsQueued(struct _XDisplay* display, int mode);
 
-    int XPending(struct _XDisplay* display)
+int XPending(struct _XDisplay* display)
+{
+    // QueuedAfterFlush = 2
+    int count = XEventsQueued(display, 2);
+    if (count == 0)
     {
-        // QueuedAfterFlush = 2
-        int count = XEventsQueued(display, 2);
-        if (count == 0)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            // QueuedAlready = 0
-            count = XEventsQueued(display, 0);
-        }
-        return count;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        // QueuedAlready = 0
+        count = XEventsQueued(display, 0);
     }
+    return count;
+}
 }
 #endif
 
@@ -183,12 +183,9 @@ public:
         // 2. Activity / Dirty detection
         const vi2d currentMousePos  = mouse.GetPosition();
         const bool mouseMoved       = (currentMousePos != m_lastMousePos);
-        const bool mouseInteracting = mouse.GetButton(0).bHeld || mouse.GetButton(0).bPressed || mouse.GetButton(0).bReleased ||
-                                      mouse.GetButton(1).bHeld || mouse.GetButton(1).bPressed || mouse.GetButton(1).bReleased ||
-                                      mouse.GetButton(2).bHeld || mouse.GetButton(2).bPressed || mouse.GetButton(2).bReleased ||
-                                      mouse.GetWheel() != 0;
-        const bool keyInteracting = keyboard.GetKey(Key::SPACE).bPressed || keyboard.GetKey(Key::SPACE).bHeld;
-        const bool isScanning     = m_shared.isScanning.load(std::memory_order_relaxed);
+        const bool mouseInteracting = mouse.GetButton(0).bHeld || mouse.GetButton(0).bPressed || mouse.GetButton(0).bReleased || mouse.GetButton(1).bHeld || mouse.GetButton(1).bPressed || mouse.GetButton(1).bReleased || mouse.GetButton(2).bHeld || mouse.GetButton(2).bPressed || mouse.GetButton(2).bReleased || mouse.GetWheel() != 0;
+        const bool keyInteracting   = keyboard.GetKey(Key::SPACE).bPressed || keyboard.GetKey(Key::SPACE).bHeld;
+        const bool isScanning       = m_shared.isScanning.load(std::memory_order_relaxed);
 
         const bool isDirty = isScanning || hasNewTree || mouseMoved || mouseInteracting || keyInteracting;
 
@@ -230,8 +227,8 @@ public:
         RenderHUD();
 
         // 4. Fallback frame rate limiter (~60 FPS) in case OpenGL driver ignores VSync
-        const auto now     = std::chrono::steady_clock::now();
-        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - m_lastFrameTime);
+        const auto     now             = std::chrono::steady_clock::now();
+        const auto     elapsed         = std::chrono::duration_cast<std::chrono::microseconds>(now - m_lastFrameTime);
         constexpr auto targetFrameTime = std::chrono::microseconds(16666);
         if (elapsed < targetFrameTime)
         {
@@ -620,8 +617,7 @@ private:
     static const FileNode* FindHoveredNode(const FileNode* node, const vf2d& pt)
     {
         if (!node || node->visualSize.x <= 0.0f || node->visualSize.y <= 0.0f) return nullptr;
-        if (pt.x < node->visualPos.x || pt.x > (node->visualPos.x + node->visualSize.x) ||
-            pt.y < node->visualPos.y || pt.y > (node->visualPos.y + node->visualSize.y))
+        if (pt.x < node->visualPos.x || pt.x > (node->visualPos.x + node->visualSize.x) || pt.y < node->visualPos.y || pt.y > (node->visualPos.y + node->visualSize.y))
         {
             return nullptr;
         }
@@ -640,8 +636,7 @@ private:
     {
         if (!node) return;
 
-        if (node->visualPos.x > viewMax.x || (node->visualPos.x + node->visualSize.x) < viewMin.x ||
-            node->visualPos.y > viewMax.y || (node->visualPos.y + node->visualSize.y) < viewMin.y)
+        if (node->visualPos.x > viewMax.x || (node->visualPos.x + node->visualSize.x) < viewMin.x || node->visualPos.y > viewMax.y || (node->visualPos.y + node->visualSize.y) < viewMin.y)
         {
             return;
         }
@@ -733,7 +728,7 @@ private:
 
 int main()
 {
-    PGEConfig config{.vScreenSize = {1920,1080}, .vPixelSize = {1,1},.bVSync = True };
+    PGEConfig config{.vScreenSize = {1920, 1080}, .vPixelSize = {1, 1}, .bVSync = True};
     config.bFullScreen = false;
     if (DiskTreemapAnalyzer demo; demo.Construct(config))
     {
