@@ -227,7 +227,7 @@ public:
 #if defined(HAS_INOTIFY)
         if (m_stopEventFd >= 0)
         {
-            uint64_t              val          = 1;
+            const uint64_t        val          = 1;
             [[maybe_unused]] auto bytesWritten = write(m_stopEventFd, &val, sizeof(val));
         }
         if (m_inotifyThread.joinable()) m_inotifyThread.join();
@@ -515,16 +515,15 @@ private:
 #if defined(HAS_INOTIFY)
         if (m_inotifyFd < 0) return;
 
-        std::error_code ec;
-        fs::path        canon   = fs::weakly_canonical(p, ec);
-        std::string     pathStr = (!ec) ? canon.string() : p.lexically_normal().string();
+        std::error_code   ec;
+        const fs::path    canon   = fs::weakly_canonical(p, ec);
+        const std::string pathStr = (!ec) ? canon.string() : p.lexically_normal().string();
 
         std::lock_guard lock(m_watchMutex);
         if (m_pathToWd.contains(pathStr)) return;
 
         constexpr uint32_t flags = IN_MODIFY | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_ATTRIB;
-        const int          wd    = inotify_add_watch(m_inotifyFd, pathStr.c_str(), flags);
-        if (wd >= 0)
+        if (const int wd = inotify_add_watch(m_inotifyFd, pathStr.c_str(), flags); wd >= 0)
         {
             m_wdToPath[wd]      = pathStr;
             m_pathToWd[pathStr] = wd;
@@ -601,9 +600,8 @@ private:
             int timeoutMs = -1;
             if (hasPendingChange)
             {
-                const auto now     = std::chrono::steady_clock::now();
-                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastEventTime);
-                if (elapsed >= debounceDuration)
+                const auto now = std::chrono::steady_clock::now();
+                if (const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastEventTime); elapsed >= debounceDuration)
                 {
                     hasPendingChange = false;
                     RequestRescan();
@@ -636,10 +634,9 @@ private:
 
             if (pfd[0].revents & POLLIN)
             {
-                const ssize_t len = read(m_inotifyFd, buffer, sizeof(buffer));
-                if (len > 0)
+                if (const ssize_t len = read(m_inotifyFd, buffer, sizeof(buffer)); len > 0)
                 {
-                    for (char* ptr = buffer; ptr < buffer + len;)
+                    for (const char* ptr = buffer; ptr < buffer + len;)
                     {
                         const auto* event = reinterpret_cast<const struct inotify_event*>(ptr);
 
@@ -658,8 +655,7 @@ private:
                             {
                                 if (event->len > 0)
                                 {
-                                    const fs::path parentPath = GetPathForWd(event->wd);
-                                    if (!parentPath.empty())
+                                    if (const fs::path parentPath = GetPathForWd(event->wd); !parentPath.empty())
                                     {
                                         AddWatchRecursive(parentPath / event->name);
                                     }
